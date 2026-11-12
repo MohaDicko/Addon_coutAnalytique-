@@ -15,9 +15,40 @@
   </Activation>
 
   <Forms>
+	<!-- Commandes clients -->
 	<Form FormType="139">
 	  <EventHandlers>
-		<EventHandler EventType="ITEM_PRESSED" />
+		<EventHandler EventType="VALIDATE" />
+	  </EventHandlers>
+	</Form>
+	<!-- Commandes fournisseurs -->
+	<Form FormType="22">
+	  <EventHandlers>
+		<EventHandler EventType="VALIDATE" />
+	  </EventHandlers>
+	</Form>
+	<!-- Réception de marchandises -->
+	<Form FormType="20">
+	  <EventHandlers>
+		<EventHandler EventType="VALIDATE" />
+	  </EventHandlers>
+	</Form>
+	<!-- Livraisons -->
+	<Form FormType="16">
+	  <EventHandlers>
+		<EventHandler EventType="VALIDATE" />
+	  </EventHandlers>
+	</Form>
+	<!-- Factures clients -->
+	<Form FormType="13">
+	  <EventHandlers>
+		<EventHandler EventType="VALIDATE" />
+	  </EventHandlers>
+	</Form>
+	<!-- Factures fournisseurs -->
+	<Form FormType="18">
+	  <EventHandlers>
+		<EventHandler EventType="VALIDATE" />
 	  </EventHandlers>
 	</Form>
   </Forms>
