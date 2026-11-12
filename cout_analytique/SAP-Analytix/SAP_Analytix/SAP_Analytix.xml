@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Manifest>
+  <AddonIdentifier>
+	<CompanyName>Safir Consulting</CompanyName>
+	<AddonName>SAP Analytix</AddonName>
+	<AddonVersion>1.0.0</AddonVersion>
+	<Description>Add-on d'automatisation des codes analytiques pour SAP Business One</Description>
+	<Publisher>Safir Consulting</Publisher>
+  </AddonIdentifier>
+
+  <Activation>
+	<ActivationKey>SAP_ANALYTIX_KEY_2026</ActivationKey>
+	<RegisteredName>SAP_Analytix</RegisteredName>
+	<RegisteredVersion>1.0.0</RegisteredVersion>
+  </Activation>
+
+  <Forms>
+	<Form FormType="139">
+	  <EventHandlers>
+		<EventHandler EventType="ITEM_PRESSED" />
+	  </EventHandlers>
+	</Form>
+  </Forms>
+
+  <Permissions>
+	<Permission Name="ReadOITM">true</Permission>
+	<Permission Name="ReadDatabaseFields">true</Permission>
+	<Permission Name="ModifyUIFields">true</Permission>
+  </Permissions>
+
+  <Dependencies>
+	<Dependency Name="SAPbouiCOM" />
+	<Dependency Name="SAPbobsCOM" />
+  </Dependencies>
+</Manifest>

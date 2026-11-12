@@ -1,0 +1,207 @@
+﻿using System;
+using System.Collections.Generic;
+using SAPbouiCOM;
+using SAPbobsCOM;
+
+namespace SAP_Analytix
+{
+    class Program
+    {
+        public static SAPbouiCOM.Application sboApplication;
+        public static SAPbobsCOM.Company oCompany;
+
+        // Configuration des formulaires à gérer avec leurs paramètres
+        private static Dictionary<string, FormConfig> FormConfigurations = new Dictionary<string, FormConfig>
+        {
+            // Commandes clients
+            { "139", new FormConfig { FormType = "139", FormName = "Sales Order", MatrixUID = "38", ItemCodeCol = "1", CostCenterCol = "U_DocAnalytique" } },
+
+            // Commandes fournisseurs
+            { "22", new FormConfig { FormType = "22", FormName = "Purchase Order", MatrixUID = "38", ItemCodeCol = "1", CostCenterCol = "U_DocAnalytique" } },
+
+            // Réception de marchandises
+            { "20", new FormConfig { FormType = "20", FormName = "Goods Receipt", MatrixUID = "38", ItemCodeCol = "1", CostCenterCol = "U_DocAnalytique" } },
+
+            // Livraison client
+            { "16", new FormConfig { FormType = "16", FormName = "Delivery", MatrixUID = "38", ItemCodeCol = "1", CostCenterCol = "U_DocAnalytique" } },
+
+            // Facture client
+            { "13", new FormConfig { FormType = "13", FormName = "Sales Invoice", MatrixUID = "38", ItemCodeCol = "1", CostCenterCol = "U_DocAnalytique" } },
+
+            // Facture fournisseur
+            { "18", new FormConfig { FormType = "18", FormName = "Purchase Invoice", MatrixUID = "38", ItemCodeCol = "1", CostCenterCol = "U_DocAnalytique" } }
+        };
+
+        [STAThread]
+        static void Main(string[] args)
+        {
+            try
+            {
+                // Connexion UI API
+                SboGuiApi sboGuiApi = new SboGuiApi();
+                string connectionString = Environment.GetCommandLineArgs()[1];
+                sboGuiApi.Connect(connectionString);
+                sboApplication = sboGuiApi.GetApplication();
+
+                sboApplication.StatusBar.SetText("SAP_Analytix connecté avec succès !", BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Success);
+
+                // Connexion DI API
+                oCompany = sboApplication.Company.GetDICompany() as SAPbobsCOM.Company;
+
+                if (oCompany == null)
+                {
+                    sboApplication.StatusBar.SetText("Erreur : Impossible de récupérer la connexion DI-API", BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Error);
+                    return;
+                }
+
+                // Abonnement aux événements UI
+                sboApplication.ItemEvent += new _IApplicationEvents_ItemEventEventHandler(SBO_Application_ItemEvent);
+
+                sboApplication.StatusBar.SetText("Add-on SAP_Analytix - Gestion des centres de coûts activée", BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Success);
+
+                System.Windows.Forms.Application.Run();
+            }
+            catch (Exception ex)
+            {
+                System.Windows.Forms.MessageBox.Show("Erreur de lancement : " + ex.Message);
+            }
+            finally
+            {
+                // Libérer les ressources
+                if (oCompany != null)
+                {
+                    System.Runtime.InteropServices.Marshal.ReleaseComObject(oCompany);
+                    oCompany = null;
+                }
+                if (sboApplication != null)
+                {
+                    System.Runtime.InteropServices.Marshal.ReleaseComObject(sboApplication);
+                    sboApplication = null;
+                }
+                GC.Collect();
+            }
+        }
+
+        private static void SBO_Application_ItemEvent(string FormUID, ref ItemEvent pVal, out bool BubbleEvent)
+        {
+            BubbleEvent = true;
+
+            try
+            {
+                string formTypeEx = pVal.FormTypeEx;
+
+                // Vérifier si c'est un formulaire géré
+                if (!FormConfigurations.ContainsKey(formTypeEx))
+                    return;
+
+                FormConfig config = FormConfigurations[formTypeEx];
+
+                // Déclencher uniquement lors d'un clic sur un article (ITEM_PRESSED) après l'action
+                if (pVal.EventType == BoEventTypes.et_ITEM_PRESSED && !pVal.BeforeAction)
+                {
+                    Form oForm = null;
+                    Matrix oMatrix = null;
+
+                    try
+                    {
+                        oForm = sboApplication.Forms.Item(FormUID);
+                        oMatrix = (Matrix)oForm.Items.Item(config.MatrixUID).Specific;
+
+                        // Récupérer le code article de la colonne configurée
+                        EditText oEditItem = (EditText)oMatrix.GetCellSpecific(config.ItemCodeCol, pVal.Row);
+                        string itemCode = oEditItem.Value;
+
+                        if (!string.IsNullOrEmpty(itemCode))
+                        {
+                            // Récupérer le centre de coûts depuis la fiche article
+                            string costCenter = GetAnalyticalCodeFromItem(itemCode);
+
+                            if (!string.IsNullOrEmpty(costCenter))
+                            {
+                                // Appliquer le centre de coûts à la colonne configurée
+                                EditText oEditCostCenter = (EditText)oMatrix.GetCellSpecific(config.CostCenterCol, pVal.Row);
+                                oEditCostCenter.Value = costCenter;
+
+                                sboApplication.StatusBar.SetText(
+                                    $"Document {config.FormName} - Centre de coûts '{costCenter}' appliqué automatiquement",
+                                    BoMessageTime.bmt_Short,
+                                    BoStatusBarMessageType.smt_Success);
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        // Libérer les ressources d'interface
+                        if (oMatrix != null)
+                        {
+                            System.Runtime.InteropServices.Marshal.ReleaseComObject(oMatrix);
+                            oMatrix = null;
+                        }
+                        if (oForm != null)
+                        {
+                            System.Runtime.InteropServices.Marshal.ReleaseComObject(oForm);
+                            oForm = null;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                sboApplication.StatusBar.SetText("Erreur Add-on : " + ex.Message, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Error);
+            }
+        }
+
+        private static string GetAnalyticalCodeFromItem(string itemCode)
+        {
+            Recordset oRec = null;
+            try
+            {
+                oRec = (Recordset)oCompany.GetBusinessObject(BoObjectTypes.BoRecordset);
+
+                // Utiliser les paramètres pour éviter l'injection SQL
+                // Échappe les guillemets simples dans le code article
+                string safeItemCode = itemCode.Replace("'", "''");
+                string query = $"SELECT \"U_Analytique\" FROM \"OITM\" WHERE \"ItemCode\" = '{safeItemCode}'";
+
+                oRec.DoQuery(query);
+
+                if (!oRec.EoF)
+                {
+                    object value = oRec.Fields.Item("U_Analytique").Value;
+                    if (value != null && value is not System.DBNull)
+                    {
+                        return value.ToString();
+                    }
+                }
+                return string.Empty;
+            }
+            catch (Exception ex)
+            {
+                sboApplication.StatusBar.SetText("Erreur GetAnalyticalCode : " + ex.Message, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Error);
+                return string.Empty;
+            }
+            finally
+            {
+                // Libérer les ressources COM
+                if (oRec != null)
+                {
+                    System.Runtime.InteropServices.Marshal.ReleaseComObject(oRec);
+                    oRec = null;
+                    GC.Collect();
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Configuration pour chaque type de formulaire SAP géré
+    /// </summary>
+    public class FormConfig
+    {
+        public string FormType { get; set; }
+        public string FormName { get; set; }
+        public string MatrixUID { get; set; }
+        public string ItemCodeCol { get; set; }
+        public string CostCenterCol { get; set; }
+    }
+}

@@ -1,0 +1,142 @@
+﻿using System;
+using SAPbouiCOM;
+using SAPbobsCOM;
+
+namespace SAP_Analytix
+{
+    class Program
+    {
+        public static SAPbouiCOM.Application sboApplication;
+        public static SAPbobsCOM.Company oCompany;
+
+        [STAThread]
+        static void Main(string[] args)
+        {
+            try
+            {
+                // Connexion UI API
+                SboGuiApi sboGuiApi = new SboGuiApi();
+                string connectionString = Environment.GetCommandLineArgs()[1];
+                sboGuiApi.Connect(connectionString);
+                sboApplication = sboGuiApi.GetApplication();
+
+                sboApplication.StatusBar.SetText("SAP_Analytix connecté avec succès !", BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Success);
+
+                // Connexion DI API
+                oCompany = sboApplication.Company.GetDICompany() as SAPbobsCOM.Company;
+
+                if (oCompany == null)
+                {
+                    sboApplication.StatusBar.SetText("Erreur : Impossible de récupérer la connexion DI-API", BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Error);
+                    return;
+                }
+
+                // Abonnement aux événements UI
+                sboApplication.ItemEvent += new _IApplicationEvents_ItemEventEventHandler(SBO_Application_ItemEvent);
+
+                sboApplication.StatusBar.SetText("Add-on SAP_Analytix prêt", BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Success);
+
+                System.Windows.Forms.Application.Run();
+            }
+            catch (Exception ex)
+            {
+                System.Windows.Forms.MessageBox.Show("Erreur de lancement : " + ex.Message);
+            }
+            finally
+            {
+                // Libérer les ressources
+                if (oCompany != null)
+                {
+                    System.Runtime.InteropServices.Marshal.ReleaseComObject(oCompany);
+                    oCompany = null;
+                }
+                if (sboApplication != null)
+                {
+                    System.Runtime.InteropServices.Marshal.ReleaseComObject(sboApplication);
+                    sboApplication = null;
+                }
+                GC.Collect();
+            }
+        }
+
+        private static void SBO_Application_ItemEvent(string FormUID, ref ItemEvent pVal, out bool BubbleEvent)
+        {
+            BubbleEvent = true;
+
+            try
+            {
+                // Exemple sur le formulaire des Commandes clients (FormTypeEx = "139")
+                // et sur la matrice des lignes (ItemUID = "38", Colonne Code Article = "1")
+                if (pVal.FormTypeEx == "139" && pVal.EventType == BoEventTypes.et_ITEM_PRESSED && !pVal.BeforeAction)
+                {
+                    if (pVal.ItemUID == "38" && pVal.ColUID == "1")
+                    {
+                        Form oForm = sboApplication.Forms.Item(FormUID);
+                        Matrix oMatrix = (Matrix)oForm.Items.Item("38").Specific;
+
+                        EditText oEditItem = (EditText)oMatrix.GetCellSpecific("1", pVal.Row);
+                        string itemCode = oEditItem.Value;
+
+                        if (!string.IsNullOrEmpty(itemCode))
+                        {
+                            // Appel DI-API pour chercher U_Analytique dans OITM
+                            string analyticalValue = GetAnalyticalCodeFromItem(itemCode);
+
+                            if (!string.IsNullOrEmpty(analyticalValue))
+                            {
+                                // Injection dans le champ analytique de la ligne (ex: U_DocAnalytique)
+                                EditText oEditAnalyticLine = (EditText)oMatrix.GetCellSpecific("U_DocAnalytique", pVal.Row);
+                                oEditAnalyticLine.Value = analyticalValue;
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                sboApplication.StatusBar.SetText("Erreur Add-on : " + ex.Message, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Error);
+            }
+        }
+
+        private static string GetAnalyticalCodeFromItem(string itemCode)
+        {
+            Recordset oRec = null;
+            try
+            {
+                oRec = (Recordset)oCompany.GetBusinessObject(BoObjectTypes.BoRecordset);
+
+                // Utiliser les paramètres pour éviter l'injection SQL
+                // Échappe les guillemets simples dans le code article
+                string safeItemCode = itemCode.Replace("'", "''");
+                string query = $"SELECT \"U_Analytique\" FROM \"OITM\" WHERE \"ItemCode\" = '{safeItemCode}'";
+
+                oRec.DoQuery(query);
+
+                if (!oRec.EoF)
+                {
+                    object value = oRec.Fields.Item("U_Analytique").Value;
+                    if (value != null && value is not System.DBNull)
+                    {
+                        return value.ToString();
+                    }
+                }
+                return string.Empty;
+            }
+            catch (Exception ex)
+            {
+                sboApplication.StatusBar.SetText("Erreur GetAnalyticalCode : " + ex.Message, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Error);
+                return string.Empty;
+            }
+            finally
+            {
+                // Libérer les ressources COM
+                if (oRec != null)
+                {
+                    System.Runtime.InteropServices.Marshal.ReleaseComObject(oRec);
+                    oRec = null;
+                    GC.Collect();
+                }
+            }
+        }
+    }
+}
