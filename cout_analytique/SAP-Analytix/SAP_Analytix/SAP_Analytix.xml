@@ -19,36 +19,48 @@
 	<Form FormType="139">
 	  <EventHandlers>
 		<EventHandler EventType="VALIDATE" />
+		<EventHandler EventType="CHOOSE_FROM_LIST" />
+		<EventHandler EventType="LOST_FOCUS" />
 	  </EventHandlers>
 	</Form>
 	<!-- Commandes fournisseurs -->
-	<Form FormType="22">
+	<Form FormType="142">
 	  <EventHandlers>
 		<EventHandler EventType="VALIDATE" />
+		<EventHandler EventType="CHOOSE_FROM_LIST" />
+		<EventHandler EventType="LOST_FOCUS" />
 	  </EventHandlers>
 	</Form>
 	<!-- Réception de marchandises -->
-	<Form FormType="20">
+	<Form FormType="143">
 	  <EventHandlers>
 		<EventHandler EventType="VALIDATE" />
+		<EventHandler EventType="CHOOSE_FROM_LIST" />
+		<EventHandler EventType="LOST_FOCUS" />
 	  </EventHandlers>
 	</Form>
 	<!-- Livraisons -->
-	<Form FormType="16">
+	<Form FormType="140">
 	  <EventHandlers>
 		<EventHandler EventType="VALIDATE" />
+		<EventHandler EventType="CHOOSE_FROM_LIST" />
+		<EventHandler EventType="LOST_FOCUS" />
 	  </EventHandlers>
 	</Form>
 	<!-- Factures clients -->
-	<Form FormType="13">
+	<Form FormType="133">
 	  <EventHandlers>
 		<EventHandler EventType="VALIDATE" />
+		<EventHandler EventType="CHOOSE_FROM_LIST" />
+		<EventHandler EventType="LOST_FOCUS" />
 	  </EventHandlers>
 	</Form>
 	<!-- Factures fournisseurs -->
-	<Form FormType="18">
+	<Form FormType="141">
 	  <EventHandlers>
 		<EventHandler EventType="VALIDATE" />
+		<EventHandler EventType="CHOOSE_FROM_LIST" />
+		<EventHandler EventType="LOST_FOCUS" />
 	  </EventHandlers>
 	</Form>
   </Forms>

@@ -1,5 +1,6 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using SAPbobsCOM;
@@ -7,25 +8,34 @@ using SAPbouiCOM;
 
 namespace SAP_Analytix
 {
-    static class Program
+    public static class Program
     {
         public static SAPbouiCOM.Application sboApplication;
         public static SAPbobsCOM.Company oCompany;
+
+        // Mémorise le dernier article sélectionné via ChooseFromList par ligne pour pouvoir l'appliquer
+        // même si SAP verrouille temporairement la cellule pendant l'événement CFL.
+        private static string _lastSelectedItemCode = string.Empty;
+        private static int _lastSelectedRow = -1;
 
         // Colonnes analytiques candidates sur les lignes de documents (par ordre de priorité)
         // 1. U_DocAnalytique (UDF ligne personnalisé)
         // 2. U_Analytique (au cas où l'UDF ligne porte le même nom que l'UDF article)
         // 3. 110000109 / 2004 (Colonnes standard SAP Règle de répartition / Centre de coûts Axe 1)
-        private static readonly string[] CandidateCostCenterCols = new string[]
+        public static readonly string[] CandidateCostCenterCols = new string[]
         {
             "U_DocAnalytique",
             "U_Analytique",
+            "U_CodeAnalytique",
+            "U_CentreCout",
             "110000109",
-            "2004"
+            "2004",
+            "110000110",
+            "2005"
         };
 
         // Configuration des formulaires gérés avec leurs paramètres (Codes FormTypeEx UI API + fallback ObjectType)
-        private static readonly Dictionary<string, FormConfig> FormConfigurations = new Dictionary<string, FormConfig>
+        public static readonly Dictionary<string, FormConfig> FormConfigurations = new Dictionary<string, FormConfig>
         {
             // Commandes clients (ORDR - FormTypeEx 139)
             { "139", new FormConfig { FormType = "139", FormName = "Commande Client", MatrixUID = "38", ItemCodeCol = "1", CostCenterCol = "U_DocAnalytique" } },
@@ -52,21 +62,46 @@ namespace SAP_Analytix
             { "141", new FormConfig { FormType = "141", FormName = "Facture Fournisseur", MatrixUID = "38", ItemCodeCol = "1", CostCenterCol = "U_DocAnalytique" } },
             { "18",  new FormConfig { FormType = "18",  FormName = "Facture Fournisseur", MatrixUID = "38", ItemCodeCol = "1", CostCenterCol = "U_DocAnalytique" } },
 
-            // Offres & Demandes d'achat / Devis / Avoirs (au cas où le consultant teste dessus)
+            // Offres & Demandes d'achat / Devis / Avoirs / Sorties & Entrées de stock
             { "149", new FormConfig { FormType = "149", FormName = "Devis Client", MatrixUID = "38", ItemCodeCol = "1", CostCenterCol = "U_DocAnalytique" } },
             { "179", new FormConfig { FormType = "179", FormName = "Avoir Client", MatrixUID = "38", ItemCodeCol = "1", CostCenterCol = "U_DocAnalytique" } },
             { "180", new FormConfig { FormType = "180", FormName = "Retour Client", MatrixUID = "38", ItemCodeCol = "1", CostCenterCol = "U_DocAnalytique" } },
             { "181", new FormConfig { FormType = "181", FormName = "Avoir Fournisseur", MatrixUID = "38", ItemCodeCol = "1", CostCenterCol = "U_DocAnalytique" } },
             { "182", new FormConfig { FormType = "182", FormName = "Retour Marchandises Fournisseur", MatrixUID = "38", ItemCodeCol = "1", CostCenterCol = "U_DocAnalytique" } },
+            { "720", new FormConfig { FormType = "720", FormName = "Sortie de Marchandises", MatrixUID = "13", ItemCodeCol = "1", CostCenterCol = "U_DocAnalytique" } },
+            { "721", new FormConfig { FormType = "721", FormName = "Entrée de Marchandises", MatrixUID = "13", ItemCodeCol = "1", CostCenterCol = "U_DocAnalytique" } },
             { "1470000200", new FormConfig { FormType = "1470000200", FormName = "Demande d'Achat", MatrixUID = "38", ItemCodeCol = "1", CostCenterCol = "U_DocAnalytique" } },
             { "540000988",  new FormConfig { FormType = "540000988",  FormName = "Offre d'Achat", MatrixUID = "38", ItemCodeCol = "1", CostCenterCol = "U_DocAnalytique" } }
         };
+
+        private static string LogFilePath => Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "SAP_Analytix_debug.log");
+
+        public static void Log(string message)
+        {
+            try
+            {
+                File.AppendAllText(LogFilePath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}{Environment.NewLine}");
+            }
+            catch
+            {
+                // Ignorer les erreurs d'écriture du journal
+            }
+        }
 
         [STAThread]
         static void Main(string[] args)
         {
             try
             {
+                // Mode d'auto-test hors-ligne pour valider toute la logique C# sans SAP ouvert
+                if (args != null && args.Length > 0 && args[0] == "--selftest")
+                {
+                    Environment.ExitCode = SelfTestRunner.RunAllTests();
+                    return;
+                }
+
+                Log("Démarrage de SAP_Analytix...");
+
                 // 1. Récupération de la chaîne de connexion passée par SAP B1
                 string connectionString = string.Empty;
                 string[] cmdArgs = Environment.GetCommandLineArgs();
@@ -89,6 +124,7 @@ namespace SAP_Analytix
                 }
                 catch (Exception ex)
                 {
+                    Log("Échec connexion UI API : " + ex.Message);
                     MessageBox.Show(
                         "Impossible de se connecter au client SAP Business One.\n" +
                         "Veuillez vous assurer que SAP Business One est ouvert et en cours d'exécution.\n\nDétail : " + ex.Message,
@@ -105,12 +141,15 @@ namespace SAP_Analytix
 
                 if (oCompany == null || !oCompany.Connected)
                 {
+                    Log("Échec connexion DI API.");
                     sboApplication.StatusBar.SetText(
                         "SAP_Analytix : Impossible d'établir la connexion DI-API.",
                         BoMessageTime.bmt_Short,
                         BoStatusBarMessageType.smt_Error);
                     return;
                 }
+
+                Log($"Connecté à la société : {oCompany.CompanyName} ({oCompany.CompanyDB})");
 
                 // 4. Abonnement aux événements UI et Cycle de vie de l'application
                 sboApplication.ItemEvent += new _IApplicationEvents_ItemEventEventHandler(SBO_Application_ItemEvent);
@@ -126,6 +165,7 @@ namespace SAP_Analytix
             }
             catch (Exception ex)
             {
+                Log("Erreur critique Main : " + ex);
                 MessageBox.Show("Erreur critique SAP_Analytix : " + ex.Message, "Erreur", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             finally
@@ -137,7 +177,7 @@ namespace SAP_Analytix
         /// <summary>
         /// Gestion des événements du cycle de vie de SAP Business One (fermeture, changement de société)
         /// </summary>
-        private static void SBO_Application_AppEvent(BoAppEventTypes EventType)
+        public static void SBO_Application_AppEvent(BoAppEventTypes EventType)
         {
             switch (EventType)
             {
@@ -153,32 +193,36 @@ namespace SAP_Analytix
         /// <summary>
         /// Gestion des événements UI sur les formulaires
         /// </summary>
-        private static void SBO_Application_ItemEvent(string FormUID, ref ItemEvent pVal, out bool BubbleEvent)
+        public static void SBO_Application_ItemEvent(string FormUID, ref ItemEvent pVal, out bool BubbleEvent)
         {
             BubbleEvent = true;
 
             try
             {
                 // Ignorer les événements avant action (BeforeAction == true)
-                if (pVal.BeforeAction)
+                if (pVal == null || pVal.BeforeAction)
                     return;
 
                 // Vérifier si le type de formulaire est configuré
                 if (string.IsNullOrEmpty(pVal.FormTypeEx) || !FormConfigurations.TryGetValue(pVal.FormTypeEx, out FormConfig config))
                     return;
 
-                // Vérifier que l'événement concerne bien la colonne Article ("1") de la matrice des lignes ("38")
-                if (pVal.ItemUID != config.MatrixUID || pVal.ColUID != config.ItemCodeCol || pVal.Row <= 0)
+                // Vérifier que l'événement concerne la matrice des lignes (ex: "38") et une ligne valide
+                if (pVal.ItemUID != config.MatrixUID || pVal.Row <= 0)
                     return;
 
-                // On intercepte :
-                // - et_CHOOSE_FROM_LIST : sélection d'un article via la loupe / touche Tab
-                // - et_VALIDATE (avec ItemChanged) : saisie directe au clavier puis validation
-                // - et_LOST_FOCUS : sortie de la cellule Article après sélection
+                // On déclenche lorsque :
+                // 1. L'utilisateur sélectionne ou valide la colonne Article ("1") ou la colonne Description ("3")
+                // 2. Ou lors du LostFocus de la colonne Article après un ChooseFromList
+                bool isItemColumn = (pVal.ColUID == config.ItemCodeCol || pVal.ColUID == "3");
+                if (!isItemColumn)
+                    return;
+
                 bool isTriggerEvent =
                     pVal.EventType == BoEventTypes.et_CHOOSE_FROM_LIST ||
                     (pVal.EventType == BoEventTypes.et_VALIDATE && pVal.ItemChanged) ||
-                    pVal.EventType == BoEventTypes.et_LOST_FOCUS;
+                    pVal.EventType == BoEventTypes.et_LOST_FOCUS ||
+                    pVal.EventType == BoEventTypes.et_COMBO_SELECT;
 
                 if (!isTriggerEvent)
                     return;
@@ -197,29 +241,47 @@ namespace SAP_Analytix
 
                     string itemCode = string.Empty;
 
-                    // Si c'est un ChooseFromList, on peut aussi lire le code article directement depuis le DataTable de l'événement
+                    // Si c'est un ChooseFromList, récupérer l'ItemCode directement depuis SelectedObjects
                     if (pVal.EventType == BoEventTypes.et_CHOOSE_FROM_LIST)
                     {
-                        IChooseFromListEvent oCFLEvento = (IChooseFromListEvent)pVal;
-                        DataTable oDataTable = oCFLEvento.SelectedObjects;
-                        if (oDataTable != null && oDataTable.Rows.Count > 0)
+                        try
                         {
-                            try
+                            IChooseFromListEvent oCFLEvento = (IChooseFromListEvent)pVal;
+                            DataTable oDataTable = oCFLEvento.SelectedObjects;
+                            if (oDataTable != null && oDataTable.Rows.Count > 0)
                             {
                                 itemCode = Convert.ToString(oDataTable.GetValue("ItemCode", 0))?.Trim() ?? string.Empty;
+                                if (!string.IsNullOrEmpty(itemCode))
+                                {
+                                    _lastSelectedItemCode = itemCode;
+                                    _lastSelectedRow = pVal.Row;
+                                }
                             }
-                            catch
-                            {
-                                // Fallback sur la lecture de la cellule
-                            }
+                        }
+                        catch
+                        {
+                            // Fallback sur la lecture de la cellule
                         }
                     }
 
-                    // Lecture depuis la cellule de la matrice si non récupéré via CFL
+                    // Lecture depuis la cellule Article ("1") de la matrice si non récupéré via CFL
                     if (string.IsNullOrEmpty(itemCode))
                     {
-                        oEditItem = (SAPbouiCOM.EditText)oMatrix.GetCellSpecific(config.ItemCodeCol, pVal.Row);
-                        itemCode = oEditItem?.Value != null ? oEditItem.Value.Trim() : string.Empty;
+                        try
+                        {
+                            oEditItem = (SAPbouiCOM.EditText)oMatrix.GetCellSpecific(config.ItemCodeCol, pVal.Row);
+                            itemCode = oEditItem?.Value != null ? oEditItem.Value.Trim() : string.Empty;
+                        }
+                        catch
+                        {
+                            // Ignorer si la cellule n'est pas un EditText
+                        }
+                    }
+
+                    // Fallback sur le dernier article mémorisé par CFL sur cette même ligne
+                    if (string.IsNullOrEmpty(itemCode) && _lastSelectedRow == pVal.Row && !string.IsNullOrEmpty(_lastSelectedItemCode))
+                    {
+                        itemCode = _lastSelectedItemCode;
                     }
 
                     if (string.IsNullOrEmpty(itemCode))
@@ -229,13 +291,11 @@ namespace SAP_Analytix
 
                     if (string.IsNullOrEmpty(costCenter))
                     {
-                        // Avertir uniquement sur Validate/CFL pour ne pas spammer sur LostFocus
                         if (pVal.EventType != BoEventTypes.et_LOST_FOCUS)
                         {
-                            sboApplication.StatusBar.SetText(
-                                $"SAP_Analytix : Aucun code analytique (U_Analytique) défini sur l'article '{itemCode}'.",
-                                BoMessageTime.bmt_Short,
-                                BoStatusBarMessageType.smt_Warning);
+                            string msg = $"SAP_Analytix : Aucun code analytique (U_Analytique) défini sur l'article '{itemCode}'.";
+                            Log(msg);
+                            sboApplication.StatusBar.SetText(msg, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Warning);
                         }
                         return;
                     }
@@ -245,6 +305,7 @@ namespace SAP_Analytix
                 }
                 catch (Exception ex)
                 {
+                    Log($"Erreur SBO_Application_ItemEvent (Form={pVal.FormTypeEx}, Row={pVal.Row}) : {ex}");
                     sboApplication.StatusBar.SetText(
                         $"SAP_Analytix - Erreur ligne {pVal.Row} : {ex.Message}",
                         BoMessageTime.bmt_Short,
@@ -252,35 +313,24 @@ namespace SAP_Analytix
                 }
                 finally
                 {
-                    if (oEditItem != null)
-                    {
-                        Marshal.ReleaseComObject(oEditItem);
-                        oEditItem = null;
-                    }
-                    if (oMatrix != null)
-                    {
-                        Marshal.ReleaseComObject(oMatrix);
-                        oMatrix = null;
-                    }
-                    if (oForm != null)
-                    {
-                        Marshal.ReleaseComObject(oForm);
-                        oForm = null;
-                    }
+                    ReleaseCom(ref oEditItem);
+                    ReleaseCom(ref oMatrix);
+                    ReleaseCom(ref oForm);
                 }
             }
             catch (Exception ex)
             {
+                Log("Erreur globale ItemEvent : " + ex.Message);
                 sboApplication?.StatusBar?.SetText("Erreur Add-on : " + ex.Message, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Error);
             }
         }
 
         /// <summary>
-        /// Tente de renseigner le code analytique dans la colonne de la matrice
+        /// Renseigne le code analytique dans la colonne de la matrice (supporte EditText ET ComboBox)
         /// </summary>
-        private static void ApplyCostCenterToRow(SAPbouiCOM.Form oForm, SAPbouiCOM.Matrix oMatrix, FormConfig config, int row, string costCenter, BoEventTypes eventType)
+        public static bool ApplyCostCenterToRow(SAPbouiCOM.Form oForm, SAPbouiCOM.Matrix oMatrix, FormConfig config, int row, string costCenter, BoEventTypes eventType)
         {
-            SAPbouiCOM.EditText oEditCostCenter = null;
+            object cellObj = null;
             try
             {
                 // Chercher la colonne cible parmi les colonnes candidates (U_DocAnalytique en priorité, puis standard SAP)
@@ -290,60 +340,75 @@ namespace SAP_Analytix
                 {
                     if (eventType != BoEventTypes.et_LOST_FOCUS)
                     {
-                        sboApplication.StatusBar.SetText(
-                            $"SAP_Analytix : Colonne '{config.CostCenterCol}' introuvable ou masquée dans [{config.FormName}]. Activez-la dans Paramètres de formulaire.",
-                            BoMessageTime.bmt_Short,
-                            BoStatusBarMessageType.smt_Error);
+                        string msg = $"SAP_Analytix : Colonne '{config.CostCenterCol}' introuvable ou masquée dans [{config.FormName}]. Activez-la dans Paramètres de formulaire.";
+                        Log(msg);
+                        sboApplication.StatusBar.SetText(msg, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Error);
                     }
-                    return;
+                    return false;
                 }
 
-                oEditCostCenter = (SAPbouiCOM.EditText)oMatrix.GetCellSpecific(targetColUID, row);
-                string currentValue = oEditCostCenter?.Value != null ? oEditCostCenter.Value.Trim() : string.Empty;
+                cellObj = oMatrix.GetCellSpecific(targetColUID, row);
+                if (cellObj == null)
+                    return false;
 
-                // Si la valeur est déjà renseignée à l'identique, ne pas réécrire inutilement
-                if (string.Equals(currentValue, costCenter, StringComparison.OrdinalIgnoreCase))
-                    return;
-
-                oForm.Freeze(true);
-                try
+                // Cas 1 : La colonne est un champ texte (EditText)
+                if (cellObj is SAPbouiCOM.EditText oEditCostCenter)
                 {
+                    string currentValue = oEditCostCenter.Value != null ? oEditCostCenter.Value.Trim() : string.Empty;
+                    if (string.Equals(currentValue, costCenter, StringComparison.OrdinalIgnoreCase))
+                        return true;
+
                     oEditCostCenter.Value = costCenter;
-
-                    sboApplication.StatusBar.SetText(
-                        $"[{config.FormName}] Code analytique '{costCenter}' appliqué à la ligne {row} (colonne {targetColUID})",
-                        BoMessageTime.bmt_Short,
-                        BoStatusBarMessageType.smt_Success);
                 }
-                finally
+                // Cas 2 : La colonne est une liste déroulante (ComboBox - ex: UDF avec valeurs liées)
+                else if (cellObj is SAPbouiCOM.ComboBox oComboCostCenter)
                 {
-                    oForm.Freeze(false);
+                    string currentValue = oComboCostCenter.Selected?.Value != null ? oComboCostCenter.Selected.Value.Trim() : string.Empty;
+                    if (string.Equals(currentValue, costCenter, StringComparison.OrdinalIgnoreCase))
+                        return true;
+
+                    try
+                    {
+                        oComboCostCenter.Select(costCenter, BoSearchKey.psk_ByValue);
+                    }
+                    catch
+                    {
+                        oComboCostCenter.Select(costCenter, BoSearchKey.psk_ByDescription);
+                    }
                 }
+                else
+                {
+                    return false;
+                }
+
+                string successMsg = $"[{config.FormName}] Code analytique '{costCenter}' appliqué à la ligne {row} (colonne {targetColUID})";
+                Log(successMsg);
+                sboApplication.StatusBar.SetText(successMsg, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Success);
+                return true;
             }
             catch (Exception ex)
             {
-                if (eventType != BoEventTypes.et_LOST_FOCUS)
+                // Pendant et_CHOOSE_FROM_LIST, SAP peut encore verrouiller la ligne jusqu'à et_LOST_FOCUS / et_VALIDATE
+                Log($"Info/Erreur écriture cellule (Event={eventType}, Row={row}) : {ex.Message}");
+                if (eventType != BoEventTypes.et_CHOOSE_FROM_LIST)
                 {
                     sboApplication.StatusBar.SetText(
-                        $"SAP_Analytix : Impossible d'écrire dans la colonne analytique (vérifiez qu'elle est visible et modifiable dans Paramètres de formulaire). Détail : {ex.Message}",
+                        $"SAP_Analytix : Impossible d'écrire dans la colonne analytique (vérifiez qu'elle est modifiable). Détail : {ex.Message}",
                         BoMessageTime.bmt_Short,
                         BoStatusBarMessageType.smt_Error);
                 }
+                return false;
             }
             finally
             {
-                if (oEditCostCenter != null)
-                {
-                    Marshal.ReleaseComObject(oEditCostCenter);
-                    oEditCostCenter = null;
-                }
+                ReleaseCom(ref cellObj);
             }
         }
 
         /// <summary>
         /// Recherche la colonne analytique présente et visible dans la matrice
         /// </summary>
-        private static string FindTargetColumnUID(SAPbouiCOM.Matrix oMatrix, string preferredCol)
+        public static string FindTargetColumnUID(SAPbouiCOM.Matrix oMatrix, string preferredCol)
         {
             SAPbouiCOM.Columns oCols = null;
             try
@@ -354,27 +419,54 @@ namespace SAP_Analytix
                 if (ColumnExistsAndEditable(oCols, preferredCol))
                     return preferredCol;
 
-                // 2. Tester les autres colonnes candidates
+                // 2. Tester les autres colonnes candidates connues
                 foreach (string candidate in CandidateCostCenterCols)
                 {
                     if (ColumnExistsAndEditable(oCols, candidate))
                         return candidate;
                 }
 
+                // 3. Parcourir toutes les colonnes de la matrice pour trouver un UDF contenant "Analyt" ou "Cout"
+                int count = oCols.Count;
+                for (int i = 0; i < count; i++)
+                {
+                    SAPbouiCOM.Column col = null;
+                    try
+                    {
+                        col = oCols.Item(i);
+                        string uid = col?.UniqueID ?? string.Empty;
+                        if (uid.StartsWith("U_", StringComparison.OrdinalIgnoreCase) &&
+                            (uid.IndexOf("Analyt", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                             uid.IndexOf("Cout", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                             uid.IndexOf("Cost", StringComparison.OrdinalIgnoreCase) >= 0) &&
+                            col.Visible && col.Editable)
+                        {
+                            return uid;
+                        }
+                    }
+                    catch
+                    {
+                        // Ignorer
+                    }
+                    finally
+                    {
+                        ReleaseCom(ref col);
+                    }
+                }
+
                 return string.Empty;
             }
             finally
             {
-                if (oCols != null)
-                {
-                    Marshal.ReleaseComObject(oCols);
-                    oCols = null;
-                }
+                ReleaseCom(ref oCols);
             }
         }
 
         private static bool ColumnExistsAndEditable(SAPbouiCOM.Columns oCols, string colUID)
         {
+            if (string.IsNullOrEmpty(colUID))
+                return false;
+
             SAPbouiCOM.Column oCol = null;
             try
             {
@@ -387,20 +479,16 @@ namespace SAP_Analytix
             }
             finally
             {
-                if (oCol != null)
-                {
-                    Marshal.ReleaseComObject(oCol);
-                    oCol = null;
-                }
+                ReleaseCom(ref oCol);
             }
         }
 
         /// <summary>
-        /// Récupère le code analytique (U_Analytique) depuis la fiche article (OITM)
+        /// Récupère le code analytique (U_Analytique ou équivalent) depuis la fiche article (OITM)
         /// </summary>
-        private static string GetAnalyticalCodeFromItem(string itemCode)
+        public static string GetAnalyticalCodeFromItem(string itemCode)
         {
-            if (oCompany == null || !oCompany.Connected)
+            if (oCompany == null || !oCompany.Connected || string.IsNullOrEmpty(itemCode))
                 return string.Empty;
 
             Recordset oRec = null;
@@ -412,7 +500,6 @@ namespace SAP_Analytix
                 oRec = (Recordset)oCompany.GetBusinessObject(BoObjectTypes.BoRecordset);
 
                 string safeItemCode = itemCode.Replace("'", "''");
-                // Sélectionne toutes les colonnes de l'article pour éviter une erreur SQL si U_Analytique porte un autre nom
                 string query = $"SELECT * FROM \"OITM\" WHERE \"ItemCode\" = '{safeItemCode}'";
 
                 oRec.DoQuery(query);
@@ -421,13 +508,19 @@ namespace SAP_Analytix
                 {
                     fields = oRec.Fields;
 
-                    // Essayer U_Analytique en priorité, puis U_DocAnalytique ou OcrCode si présent
-                    string[] itemCandidateFields = new string[] { "U_Analytique", "U_DocAnalytique", "U_CentreCout", "CardCode" };
+                    // 1. Essayer les noms explicites en priorité
+                    string[] itemCandidateFields = new string[]
+                    {
+                        "U_Analytique",
+                        "U_DocAnalytique",
+                        "U_CodeAnalytique",
+                        "U_CentreCout",
+                        "OcrCode",
+                        "OcrCode2"
+                    };
+
                     foreach (string fieldName in itemCandidateFields)
                     {
-                        if (fieldName == "CardCode")
-                            break; // Ne pas utiliser CardCode, c'était juste un marqueur de fin
-
                         try
                         {
                             field = fields.Item(fieldName);
@@ -445,11 +538,39 @@ namespace SAP_Analytix
                         }
                         finally
                         {
-                            if (field != null)
+                            ReleaseCom(ref field);
+                        }
+                    }
+
+                    // 2. Fallback : chercher tout champ UDF (U_*) contenant "Analyt" ou "Cout" dans OITM
+                    int fieldCount = fields.Count;
+                    for (int i = 0; i < fieldCount; i++)
+                    {
+                        try
+                        {
+                            field = fields.Item(i);
+                            string name = field?.Name ?? string.Empty;
+                            if (name.StartsWith("U_", StringComparison.OrdinalIgnoreCase) &&
+                                (name.IndexOf("Analyt", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                 name.IndexOf("Cout", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                 name.IndexOf("Cost", StringComparison.OrdinalIgnoreCase) >= 0))
                             {
-                                Marshal.ReleaseComObject(field);
-                                field = null;
+                                object val = field.Value;
+                                if (val != null && !(val is DBNull))
+                                {
+                                    string strVal = val.ToString().Trim();
+                                    if (!string.IsNullOrEmpty(strVal))
+                                        return strVal;
+                                }
                             }
+                        }
+                        catch
+                        {
+                            // Ignorer
+                        }
+                        finally
+                        {
+                            ReleaseCom(ref field);
                         }
                     }
                 }
@@ -458,26 +579,34 @@ namespace SAP_Analytix
             }
             catch (Exception ex)
             {
+                Log("Erreur GetAnalyticalCodeFromItem : " + ex.Message);
                 sboApplication?.StatusBar?.SetText("Erreur lecture fiche article : " + ex.Message, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Error);
                 return string.Empty;
             }
             finally
             {
-                if (field != null)
+                ReleaseCom(ref field);
+                ReleaseCom(ref fields);
+                ReleaseCom(ref oRec);
+            }
+        }
+
+        private static void ReleaseCom<T>(ref T comObj) where T : class
+        {
+            if (comObj != null)
+            {
+                try
                 {
-                    Marshal.ReleaseComObject(field);
-                    field = null;
+                    if (Marshal.IsComObject(comObj))
+                    {
+                        Marshal.ReleaseComObject(comObj);
+                    }
                 }
-                if (fields != null)
+                catch
                 {
-                    Marshal.ReleaseComObject(fields);
-                    fields = null;
+                    // Ignorer en mode test unitaire
                 }
-                if (oRec != null)
-                {
-                    Marshal.ReleaseComObject(oRec);
-                    oRec = null;
-                }
+                comObj = null;
             }
         }
 
@@ -494,15 +623,10 @@ namespace SAP_Analytix
                     {
                         oCompany.Disconnect();
                     }
-                    Marshal.ReleaseComObject(oCompany);
-                    oCompany = null;
+                    ReleaseCom(ref oCompany);
                 }
 
-                if (sboApplication != null)
-                {
-                    Marshal.ReleaseComObject(sboApplication);
-                    sboApplication = null;
-                }
+                ReleaseCom(ref sboApplication);
 
                 GC.Collect();
                 GC.WaitForPendingFinalizers();
