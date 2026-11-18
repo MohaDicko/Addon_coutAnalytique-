@@ -8,30 +8,65 @@ using SAPbouiCOM;
 
 namespace SAP_Analytix
 {
+    /// <summary>
+    /// Contient les codes analytiques récupérés depuis la fiche article (OITM)
+    /// pour l'UDF personnalisé et/ou chacun des 5 axes analytiques SAP B1 (Dimensions 1 à 5).
+    /// </summary>
+    public class ItemAnalyticalData
+    {
+        public string CustomUdfValue { get; set; } = string.Empty;
+
+        // Codes par axe analytique SAP (1 = OcrCode, 2 = OcrCode2, 3 = OcrCode3, 4 = OcrCode4, 5 = OcrCode5)
+        public Dictionary<int, string> DimensionValues { get; } = new Dictionary<int, string>();
+
+        public bool HasAnyValue => !string.IsNullOrEmpty(CustomUdfValue) || DimensionValues.Count > 0;
+    }
+
     public static class Program
     {
         public static SAPbouiCOM.Application sboApplication;
         public static SAPbobsCOM.Company oCompany;
 
-        // Mémorise le dernier article sélectionné via ChooseFromList par ligne pour pouvoir l'appliquer
-        // même si SAP verrouille temporairement la cellule pendant l'événement CFL.
+        // Mémorise le dernier article sélectionné via ChooseFromList par ligne
         private static string _lastSelectedItemCode = string.Empty;
         private static int _lastSelectedRow = -1;
 
-        // Colonnes analytiques candidates sur les lignes de documents (par ordre de priorité)
-        // 1. U_DocAnalytique (UDF ligne personnalisé)
-        // 2. U_Analytique (au cas où l'UDF ligne porte le même nom que l'UDF article)
-        // 3. 110000109 / 2004 (Colonnes standard SAP Règle de répartition / Centre de coûts Axe 1)
+        // Colonnes UDF personnalisées candidates sur les lignes de documents
+        public static readonly string[] CandidateCustomUdfCols = new string[]
+        {
+            "U_DocAnalytique",
+            "U_Analytique",
+            "U_CodeAnalytique",
+            "U_CentreCout"
+        };
+
+        // Correspondance des 5 axes analytiques SAP Business One dans la matrice des lignes (UIDs UI API & Alias DB)
+        public static readonly Dictionary<int, string[]> DimensionColumnCandidates = new Dictionary<int, string[]>
+        {
+            // Axe 1 (OcrCode)
+            { 1, new[] { "2004", "110000109", "OcrCode" } },
+            // Axe 2 (OcrCode2)
+            { 2, new[] { "2005", "110000110", "10001066", "OcrCode2" } },
+            // Axe 3 (OcrCode3 - ex: Direction commerciale)
+            { 3, new[] { "2006", "110000111", "10001068", "OcrCode3" } },
+            // Axe 4 (OcrCode4 - ex: Maintenance)
+            { 4, new[] { "2007", "110000112", "10001070", "OcrCode4" } },
+            // Axe 5 (OcrCode5 - ex: Support)
+            { 5, new[] { "2008", "110000113", "10001072", "OcrCode5" } }
+        };
+
+        // Liste globale pour compatibilité ascendante
         public static readonly string[] CandidateCostCenterCols = new string[]
         {
             "U_DocAnalytique",
             "U_Analytique",
             "U_CodeAnalytique",
             "U_CentreCout",
-            "110000109",
-            "2004",
-            "110000110",
-            "2005"
+            "110000109", "2004",
+            "110000110", "2005", "10001066",
+            "110000111", "2006", "10001068",
+            "110000112", "2007", "10001070",
+            "110000113", "2008", "10001072"
         };
 
         // Configuration des formulaires gérés avec leurs paramètres (Codes FormTypeEx UI API + fallback ObjectType)
@@ -100,7 +135,7 @@ namespace SAP_Analytix
                     return;
                 }
 
-                Log("Démarrage de SAP_Analytix...");
+                Log("Démarrage de SAP_Analytix (Support multi-axes 1 à 5)...");
 
                 // 1. Récupération de la chaîne de connexion passée par SAP B1
                 string connectionString = string.Empty;
@@ -156,7 +191,7 @@ namespace SAP_Analytix
                 sboApplication.AppEvent += new _IApplicationEvents_AppEventEventHandler(SBO_Application_AppEvent);
 
                 sboApplication.StatusBar.SetText(
-                    "SAP_Analytix connecté avec succès (Gestion analytique active)",
+                    "SAP_Analytix connecté avec succès (Gestion analytique 5 axes active)",
                     BoMessageTime.bmt_Short,
                     BoStatusBarMessageType.smt_Success);
 
@@ -199,21 +234,15 @@ namespace SAP_Analytix
 
             try
             {
-                // Ignorer les événements avant action (BeforeAction == true)
                 if (pVal == null || pVal.BeforeAction)
                     return;
 
-                // Vérifier si le type de formulaire est configuré
                 if (string.IsNullOrEmpty(pVal.FormTypeEx) || !FormConfigurations.TryGetValue(pVal.FormTypeEx, out FormConfig config))
                     return;
 
-                // Vérifier que l'événement concerne la matrice des lignes (ex: "38") et une ligne valide
                 if (pVal.ItemUID != config.MatrixUID || pVal.Row <= 0)
                     return;
 
-                // On déclenche lorsque :
-                // 1. L'utilisateur sélectionne ou valide la colonne Article ("1") ou la colonne Description ("3")
-                // 2. Ou lors du LostFocus de la colonne Article après un ChooseFromList
                 bool isItemColumn = (pVal.ColUID == config.ItemCodeCol || pVal.ColUID == "3");
                 if (!isItemColumn)
                     return;
@@ -241,7 +270,7 @@ namespace SAP_Analytix
 
                     string itemCode = string.Empty;
 
-                    // Si c'est un ChooseFromList, récupérer l'ItemCode directement depuis SelectedObjects
+                    // Si c'est un ChooseFromList, récupérer l'ItemCode depuis SelectedObjects
                     if (pVal.EventType == BoEventTypes.et_CHOOSE_FROM_LIST)
                     {
                         try
@@ -264,7 +293,6 @@ namespace SAP_Analytix
                         }
                     }
 
-                    // Lecture depuis la cellule Article ("1") de la matrice si non récupéré via CFL
                     if (string.IsNullOrEmpty(itemCode))
                     {
                         try
@@ -274,11 +302,10 @@ namespace SAP_Analytix
                         }
                         catch
                         {
-                            // Ignorer si la cellule n'est pas un EditText
+                            // Ignorer
                         }
                     }
 
-                    // Fallback sur le dernier article mémorisé par CFL sur cette même ligne
                     if (string.IsNullOrEmpty(itemCode) && _lastSelectedRow == pVal.Row && !string.IsNullOrEmpty(_lastSelectedItemCode))
                     {
                         itemCode = _lastSelectedItemCode;
@@ -287,21 +314,21 @@ namespace SAP_Analytix
                     if (string.IsNullOrEmpty(itemCode))
                         return;
 
-                    string costCenter = GetAnalyticalCodeFromItem(itemCode);
+                    ItemAnalyticalData analyticalData = GetAnalyticalDataFromItem(itemCode);
 
-                    if (string.IsNullOrEmpty(costCenter))
+                    if (analyticalData == null || !analyticalData.HasAnyValue)
                     {
                         if (pVal.EventType != BoEventTypes.et_LOST_FOCUS)
                         {
-                            string msg = $"SAP_Analytix : Aucun code analytique (U_Analytique) défini sur l'article '{itemCode}'.";
+                            string msg = $"SAP_Analytix : Aucun code analytique défini sur l'article '{itemCode}'.";
                             Log(msg);
                             sboApplication.StatusBar.SetText(msg, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Warning);
                         }
                         return;
                     }
 
-                    // Affectation dans la colonne analytique de la ligne
-                    ApplyCostCenterToRow(oForm, oMatrix, config, pVal.Row, costCenter, pVal.EventType);
+                    // Affectation sur tous les axes analytiques concernés (1 à 5) et/ou l'UDF personnalisé
+                    ApplyAnalyticalDataToRow(oForm, oMatrix, config, pVal.Row, analyticalData, pVal.EventType);
                 }
                 catch (Exception ex)
                 {
@@ -326,32 +353,97 @@ namespace SAP_Analytix
         }
 
         /// <summary>
-        /// Renseigne le code analytique dans la colonne de la matrice (supporte EditText ET ComboBox)
+        /// Applique les codes analytiques de l'article sur les colonnes correspondantes (Axes 1 à 5 + UDF) de la ligne
         /// </summary>
-        public static bool ApplyCostCenterToRow(SAPbouiCOM.Form oForm, SAPbouiCOM.Matrix oMatrix, FormConfig config, int row, string costCenter, BoEventTypes eventType)
+        public static bool ApplyAnalyticalDataToRow(
+            SAPbouiCOM.Form oForm,
+            SAPbouiCOM.Matrix oMatrix,
+            FormConfig config,
+            int row,
+            ItemAnalyticalData data,
+            BoEventTypes eventType)
+        {
+            List<string> appliedSummary = new List<string>();
+            bool anyColumnFound = false;
+
+            // 1. Si des valeurs par axe analytique (Dimensions 1 à 5 : ex. Direction commerciale, Maintenance, Support) sont présentes
+            foreach (KeyValuePair<int, string> kvp in data.DimensionValues)
+            {
+                int dimCode = kvp.Key;
+                string costCenter = kvp.Value;
+                if (string.IsNullOrEmpty(costCenter))
+                    continue;
+
+                string dimColUID = FindColumnForDimension(oMatrix, dimCode);
+                if (!string.IsNullOrEmpty(dimColUID))
+                {
+                    anyColumnFound = true;
+                    if (WriteValueToMatrixCell(oMatrix, dimColUID, row, costCenter))
+                    {
+                        appliedSummary.Add($"Axe {dimCode}: '{costCenter}' (col {dimColUID})");
+                    }
+                }
+            }
+
+            // 2. Si une valeur UDF (ex: U_Analytique) est présente, essayer aussi de remplir la colonne UDF de ligne (ex: U_DocAnalytique)
+            // ou, si aucune colonne d'axe spécifique n'a été trouvée, utiliser FindTargetColumnUID en repli
+            if (!string.IsNullOrEmpty(data.CustomUdfValue))
+            {
+                string udfColUID = FindCustomUdfColumnUID(oMatrix, config.CostCenterCol);
+                if (!string.IsNullOrEmpty(udfColUID))
+                {
+                    anyColumnFound = true;
+                    if (WriteValueToMatrixCell(oMatrix, udfColUID, row, data.CustomUdfValue))
+                    {
+                        appliedSummary.Add($"{udfColUID}: '{data.CustomUdfValue}'");
+                    }
+                }
+                else if (!anyColumnFound)
+                {
+                    // Repli générique sur n'importe quelle colonne analytique disponible
+                    string fallbackColUID = FindTargetColumnUID(oMatrix, config.CostCenterCol);
+                    if (!string.IsNullOrEmpty(fallbackColUID))
+                    {
+                        anyColumnFound = true;
+                        if (WriteValueToMatrixCell(oMatrix, fallbackColUID, row, data.CustomUdfValue))
+                        {
+                            appliedSummary.Add($"{fallbackColUID}: '{data.CustomUdfValue}'");
+                        }
+                    }
+                }
+            }
+
+            if (!anyColumnFound)
+            {
+                if (eventType != BoEventTypes.et_LOST_FOCUS)
+                {
+                    string msg = $"SAP_Analytix : Colonnes analytiques introuvables ou masquées dans [{config.FormName}]. Activez les axes (1 à 5) ou '{config.CostCenterCol}' dans Paramètres de formulaire.";
+                    Log(msg);
+                    sboApplication.StatusBar.SetText(msg, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Error);
+                }
+                return false;
+            }
+
+            if (appliedSummary.Count > 0)
+            {
+                string successMsg = $"[{config.FormName}] Code analytique appliqué ligne {row} -> {string.Join(", ", appliedSummary)}";
+                Log(successMsg);
+                sboApplication.StatusBar.SetText(successMsg, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Success);
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool WriteValueToMatrixCell(SAPbouiCOM.Matrix oMatrix, string targetColUID, int row, string costCenter)
         {
             object cellObj = null;
             try
             {
-                // Chercher la colonne cible parmi les colonnes candidates (U_DocAnalytique en priorité, puis standard SAP)
-                string targetColUID = FindTargetColumnUID(oMatrix, config.CostCenterCol);
-
-                if (string.IsNullOrEmpty(targetColUID))
-                {
-                    if (eventType != BoEventTypes.et_LOST_FOCUS)
-                    {
-                        string msg = $"SAP_Analytix : Colonne '{config.CostCenterCol}' introuvable ou masquée dans [{config.FormName}]. Activez-la dans Paramètres de formulaire.";
-                        Log(msg);
-                        sboApplication.StatusBar.SetText(msg, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Error);
-                    }
-                    return false;
-                }
-
                 cellObj = oMatrix.GetCellSpecific(targetColUID, row);
                 if (cellObj == null)
                     return false;
 
-                // Cas 1 : La colonne est un champ texte (EditText)
                 if (cellObj is SAPbouiCOM.EditText oEditCostCenter)
                 {
                     string currentValue = oEditCostCenter.Value != null ? oEditCostCenter.Value.Trim() : string.Empty;
@@ -359,8 +451,8 @@ namespace SAP_Analytix
                         return true;
 
                     oEditCostCenter.Value = costCenter;
+                    return true;
                 }
-                // Cas 2 : La colonne est une liste déroulante (ComboBox - ex: UDF avec valeurs liées)
                 else if (cellObj is SAPbouiCOM.ComboBox oComboCostCenter)
                 {
                     string currentValue = oComboCostCenter.Selected?.Value != null ? oComboCostCenter.Selected.Value.Trim() : string.Empty;
@@ -375,28 +467,14 @@ namespace SAP_Analytix
                     {
                         oComboCostCenter.Select(costCenter, BoSearchKey.psk_ByDescription);
                     }
-                }
-                else
-                {
-                    return false;
+                    return true;
                 }
 
-                string successMsg = $"[{config.FormName}] Code analytique '{costCenter}' appliqué à la ligne {row} (colonne {targetColUID})";
-                Log(successMsg);
-                sboApplication.StatusBar.SetText(successMsg, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Success);
-                return true;
+                return false;
             }
             catch (Exception ex)
             {
-                // Pendant et_CHOOSE_FROM_LIST, SAP peut encore verrouiller la ligne jusqu'à et_LOST_FOCUS / et_VALIDATE
-                Log($"Info/Erreur écriture cellule (Event={eventType}, Row={row}) : {ex.Message}");
-                if (eventType != BoEventTypes.et_CHOOSE_FROM_LIST)
-                {
-                    sboApplication.StatusBar.SetText(
-                        $"SAP_Analytix : Impossible d'écrire dans la colonne analytique (vérifiez qu'elle est modifiable). Détail : {ex.Message}",
-                        BoMessageTime.bmt_Short,
-                        BoStatusBarMessageType.smt_Error);
-                }
+                Log($"Erreur écriture cellule col={targetColUID}, row={row}, val={costCenter} : {ex.Message}");
                 return false;
             }
             finally
@@ -406,27 +484,91 @@ namespace SAP_Analytix
         }
 
         /// <summary>
-        /// Recherche la colonne analytique présente et visible dans la matrice
+        /// Trouve la colonne de la matrice correspondant exactement à l'axe analytique SAP (1 à 5)
+        /// via son DataBind.Alias (OcrCode, OcrCode2..5) ou son UID standard (2004..2008 / 110000109..110000113 / 10001066..10001072)
         /// </summary>
-        public static string FindTargetColumnUID(SAPbouiCOM.Matrix oMatrix, string preferredCol)
+        public static string FindColumnForDimension(SAPbouiCOM.Matrix oMatrix, int dimCode)
+        {
+            SAPbouiCOM.Columns oCols = null;
+            try
+            {
+                oCols = oMatrix.Columns;
+                string expectedAlias = dimCode <= 1 ? "OcrCode" : $"OcrCode{dimCode}";
+
+                // 1. Tester les UIDs candidats connus pour cette dimension
+                if (DimensionColumnCandidates.TryGetValue(dimCode, out string[] candidates))
+                {
+                    foreach (string colUID in candidates)
+                    {
+                        if (ColumnExistsAndEditable(oCols, colUID))
+                            return colUID;
+                    }
+                }
+
+                // 2. Parcourir les colonnes de la matrice pour vérifier DataBind.Alias == OcrCode / OcrCode2..5
+                // ou un UDF spécifique à cet axe (ex: U_Analytique3, U_Axe3)
+                int count = oCols.Count;
+                for (int i = 0; i < count; i++)
+                {
+                    SAPbouiCOM.Column col = null;
+                    SAPbouiCOM.DataBind db = null;
+                    try
+                    {
+                        col = oCols.Item(i);
+                        if (col == null || !col.Visible || !col.Editable)
+                            continue;
+
+                        string uid = col.UniqueID ?? string.Empty;
+                        if (string.Equals(uid, expectedAlias, StringComparison.OrdinalIgnoreCase))
+                            return uid;
+
+                        try
+                        {
+                            db = col.DataBind;
+                            string alias = db?.Alias ?? string.Empty;
+                            if (string.Equals(alias, expectedAlias, StringComparison.OrdinalIgnoreCase))
+                                return uid;
+                        }
+                        catch
+                        {
+                            // Ignorer si DataBind non accessible
+                        }
+                    }
+                    catch
+                    {
+                        // Ignorer
+                    }
+                    finally
+                    {
+                        ReleaseCom(ref db);
+                        ReleaseCom(ref col);
+                    }
+                }
+
+                return string.Empty;
+            }
+            finally
+            {
+                ReleaseCom(ref oCols);
+            }
+        }
+
+        public static string FindCustomUdfColumnUID(SAPbouiCOM.Matrix oMatrix, string preferredCol)
         {
             SAPbouiCOM.Columns oCols = null;
             try
             {
                 oCols = oMatrix.Columns;
 
-                // 1. Tester la colonne préférée (ex: U_DocAnalytique)
                 if (ColumnExistsAndEditable(oCols, preferredCol))
                     return preferredCol;
 
-                // 2. Tester les autres colonnes candidates connues
-                foreach (string candidate in CandidateCostCenterCols)
+                foreach (string candidate in CandidateCustomUdfCols)
                 {
                     if (ColumnExistsAndEditable(oCols, candidate))
                         return candidate;
                 }
 
-                // 3. Parcourir toutes les colonnes de la matrice pour trouver un UDF contenant "Analyt" ou "Cout"
                 int count = oCols.Count;
                 for (int i = 0; i < count; i++)
                 {
@@ -462,6 +604,25 @@ namespace SAP_Analytix
             }
         }
 
+        /// <summary>
+        /// Recherche n'importe quelle colonne analytique présente et visible dans la matrice
+        /// </summary>
+        public static string FindTargetColumnUID(SAPbouiCOM.Matrix oMatrix, string preferredCol)
+        {
+            string udfCol = FindCustomUdfColumnUID(oMatrix, preferredCol);
+            if (!string.IsNullOrEmpty(udfCol))
+                return udfCol;
+
+            for (int dim = 1; dim <= 5; dim++)
+            {
+                string dimCol = FindColumnForDimension(oMatrix, dim);
+                if (!string.IsNullOrEmpty(dimCol))
+                    return dimCol;
+            }
+
+            return string.Empty;
+        }
+
         private static bool ColumnExistsAndEditable(SAPbouiCOM.Columns oCols, string colUID)
         {
             if (string.IsNullOrEmpty(colUID))
@@ -484,16 +645,20 @@ namespace SAP_Analytix
         }
 
         /// <summary>
-        /// Récupère le code analytique (U_Analytique ou équivalent) depuis la fiche article (OITM)
+        /// Récupère toutes les données analytiques d'un article (OITM) :
+        /// - Les 5 axes analytiques standard (OcrCode, OcrCode2, OcrCode3, OcrCode4, OcrCode5)
+        /// - Les champs UDF personnalisés (U_Analytique, etc.)
+        /// - Et détermine automatiquement à quel axe (1 à 5) appartient un centre de coût via la table OOCR !
         /// </summary>
-        public static string GetAnalyticalCodeFromItem(string itemCode)
+        public static ItemAnalyticalData GetAnalyticalDataFromItem(string itemCode)
         {
+            ItemAnalyticalData result = new ItemAnalyticalData();
+
             if (oCompany == null || !oCompany.Connected || string.IsNullOrEmpty(itemCode))
-                return string.Empty;
+                return result;
 
             Recordset oRec = null;
             SAPbobsCOM.Fields fields = null;
-            SAPbobsCOM.Field field = null;
 
             try
             {
@@ -508,59 +673,70 @@ namespace SAP_Analytix
                 {
                     fields = oRec.Fields;
 
-                    // 1. Essayer les noms explicites en priorité
-                    string[] itemCandidateFields = new string[]
+                    // 1. Lire les 5 axes analytiques standard sur la fiche article (OcrCode, OcrCode2, OcrCode3, OcrCode4, OcrCode5)
+                    for (int dim = 1; dim <= 5; dim++)
                     {
-                        "U_Analytique",
-                        "U_DocAnalytique",
-                        "U_CodeAnalytique",
-                        "U_CentreCout",
-                        "OcrCode",
-                        "OcrCode2"
-                    };
-
-                    foreach (string fieldName in itemCandidateFields)
-                    {
-                        try
+                        string ocrFieldName = dim == 1 ? "OcrCode" : $"OcrCode{dim}";
+                        string val = ReadFieldString(fields, ocrFieldName);
+                        if (!string.IsNullOrEmpty(val))
                         {
-                            field = fields.Item(fieldName);
-                            object val = field?.Value;
-                            if (val != null && !(val is DBNull))
-                            {
-                                string strVal = val.ToString().Trim();
-                                if (!string.IsNullOrEmpty(strVal))
-                                    return strVal;
-                            }
-                        }
-                        catch
-                        {
-                            // Ce champ n'existe pas sur OITM, on passe au suivant
-                        }
-                        finally
-                        {
-                            ReleaseCom(ref field);
+                            result.DimensionValues[dim] = val;
                         }
                     }
 
-                    // 2. Fallback : chercher tout champ UDF (U_*) contenant "Analyt" ou "Cout" dans OITM
+                    // 2. Lire les champs UDF explicites (U_Analytique, U_DocAnalytique, U_CodeAnalytique, U_CentreCout)
+                    string[] udfCandidates = new[] { "U_Analytique", "U_DocAnalytique", "U_CodeAnalytique", "U_CentreCout" };
+                    foreach (string udfName in udfCandidates)
+                    {
+                        string val = ReadFieldString(fields, udfName);
+                        if (!string.IsNullOrEmpty(val))
+                        {
+                            if (string.IsNullOrEmpty(result.CustomUdfValue))
+                                result.CustomUdfValue = val;
+
+                            // Déterminer à quel axe (DimCode 1..5) appartient ce centre de coût dans OOCR
+                            int dimCode = GetDimensionForCostCenter(val);
+                            if (dimCode >= 1 && dimCode <= 5 && !result.DimensionValues.ContainsKey(dimCode))
+                            {
+                                result.DimensionValues[dimCode] = val;
+                            }
+                        }
+                    }
+
+                    // 3. Parcourir tous les autres champs UDF (U_*) de OITM contenant "Analyt", "Cout", "Cost" ou "Axe"
+                    // (ex: s'ils ont créé U_Analytique1..5 ou U_Axe1..5 ou U_DirComm, U_Maintenance, U_Support)
                     int fieldCount = fields.Count;
                     for (int i = 0; i < fieldCount; i++)
                     {
+                        SAPbobsCOM.Field f = null;
                         try
                         {
-                            field = fields.Item(i);
-                            string name = field?.Name ?? string.Empty;
-                            if (name.StartsWith("U_", StringComparison.OrdinalIgnoreCase) &&
-                                (name.IndexOf("Analyt", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                 name.IndexOf("Cout", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                 name.IndexOf("Cost", StringComparison.OrdinalIgnoreCase) >= 0))
+                            f = fields.Item(i);
+                            string name = f?.Name ?? string.Empty;
+                            if (!name.StartsWith("U_", StringComparison.OrdinalIgnoreCase))
+                                continue;
+
+                            if (name.IndexOf("Analyt", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                name.IndexOf("Cout", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                name.IndexOf("Cost", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                name.IndexOf("Axe", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                name.IndexOf("Ocr", StringComparison.OrdinalIgnoreCase) >= 0)
                             {
-                                object val = field.Value;
-                                if (val != null && !(val is DBNull))
+                                object raw = f.Value;
+                                if (raw != null && !(raw is DBNull))
                                 {
-                                    string strVal = val.ToString().Trim();
+                                    string strVal = raw.ToString().Trim();
                                     if (!string.IsNullOrEmpty(strVal))
-                                        return strVal;
+                                    {
+                                        if (string.IsNullOrEmpty(result.CustomUdfValue))
+                                            result.CustomUdfValue = strVal;
+
+                                        int dimCode = GetDimensionForCostCenter(strVal);
+                                        if (dimCode >= 1 && dimCode <= 5 && !result.DimensionValues.ContainsKey(dimCode))
+                                        {
+                                            result.DimensionValues[dimCode] = strVal;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -570,18 +746,61 @@ namespace SAP_Analytix
                         }
                         finally
                         {
-                            ReleaseCom(ref field);
+                            ReleaseCom(ref f);
                         }
                     }
                 }
-
-                return string.Empty;
             }
             catch (Exception ex)
             {
-                Log("Erreur GetAnalyticalCodeFromItem : " + ex.Message);
+                Log("Erreur GetAnalyticalDataFromItem : " + ex.Message);
                 sboApplication?.StatusBar?.SetText("Erreur lecture fiche article : " + ex.Message, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Error);
-                return string.Empty;
+            }
+            finally
+            {
+                ReleaseCom(ref fields);
+                ReleaseCom(ref oRec);
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Interroge la table OOCR (Centres de coûts / Règles de répartition SAP) pour connaître
+        /// le numéro d'axe analytique (DimCode 1 à 5) auquel appartient un code analytique donné.
+        /// </summary>
+        public static int GetDimensionForCostCenter(string costCenterCode)
+        {
+            if (oCompany == null || !oCompany.Connected || string.IsNullOrEmpty(costCenterCode))
+                return 0;
+
+            Recordset oRec = null;
+            SAPbobsCOM.Fields fields = null;
+            SAPbobsCOM.Field field = null;
+
+            try
+            {
+                oRec = (Recordset)oCompany.GetBusinessObject(BoObjectTypes.BoRecordset);
+                string safeCode = costCenterCode.Replace("'", "''");
+                string query = $"SELECT \"DimCode\" FROM \"OOCR\" WHERE \"OcrCode\" = '{safeCode}'";
+                oRec.DoQuery(query);
+
+                if (!oRec.EoF)
+                {
+                    fields = oRec.Fields;
+                    field = fields.Item("DimCode");
+                    object val = field?.Value;
+                    if (val != null && !(val is DBNull))
+                    {
+                        int dim = Convert.ToInt32(val);
+                        if (dim >= 1 && dim <= 5)
+                            return dim;
+                    }
+                }
+            }
+            catch
+            {
+                // En cas d'absence dans OOCR (ex: code purement personnalisé hors comptabilité analytique SAP), renvoyer 0
             }
             finally
             {
@@ -589,6 +808,31 @@ namespace SAP_Analytix
                 ReleaseCom(ref fields);
                 ReleaseCom(ref oRec);
             }
+
+            return 0;
+        }
+
+        private static string ReadFieldString(SAPbobsCOM.Fields fields, string fieldName)
+        {
+            SAPbobsCOM.Field field = null;
+            try
+            {
+                field = fields.Item(fieldName);
+                object val = field?.Value;
+                if (val != null && !(val is DBNull))
+                {
+                    return val.ToString().Trim();
+                }
+            }
+            catch
+            {
+                // Le champ n'existe pas
+            }
+            finally
+            {
+                ReleaseCom(ref field);
+            }
+            return string.Empty;
         }
 
         private static void ReleaseCom<T>(ref T comObj) where T : class
