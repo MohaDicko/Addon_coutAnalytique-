@@ -128,7 +128,50 @@ namespace SAP_Analytix
             AssertTest("Routage automatique de U_Analytique vers la colonne Axe 3 (Direction commerciale) via OOCR.DimCode=3", () =>
                 RunUdfToDimensionRoutingScenario(udfCostCenter: "CC-DIR-COMM", oocrDimCode: 3, matrixColUID: "2006", matrixColAlias: "OcrCode3"));
 
-            // Test 6 : Vérifier le message d'avertissement quand l'article n'a pas de code analytique
+            // Test 6 : Résolution par Nom/Libellé dans OITM.U_Analytique vers le OcrCode et l'Axe correspondant via OOCR
+            AssertTest("Résolution par libellé 'Direction commerciale' dans U_Analytique -> OcrCode 'CC_DIR_COM' sur Axe 3 (col '2006')", () =>
+                RunLabelResolutionScenario("Direction commerciale", "CC_DIR_COM", dimCode: 3, matrixColUID: "2006", matrixColAlias: "OcrCode3"));
+
+            AssertTest("Résolution par libellé 'Maintenance' dans U_Analytique -> OcrCode 'CC_MAINT' sur Axe 4 (col '2007')", () =>
+                RunLabelResolutionScenario("Maintenance", "CC_MAINT", dimCode: 4, matrixColUID: "2007", matrixColAlias: "OcrCode4"));
+
+            AssertTest("Résolution par libellé 'Support' dans U_Analytique -> OcrCode 'CC_SUPP' sur Axe 5 (col '2008')", () =>
+                RunLabelResolutionScenario("Support", "CC_SUPP", dimCode: 5, matrixColUID: "2008", matrixColAlias: "OcrCode5"));
+
+            // Test 7 : Sélection dans un ComboBox (ValidValues) insensible à la casse/accents entre OITM et ValidValues
+            AssertTest("ComboBox ValidValues : 'Direction commerciale' sélectionne Value='CC_DIR_COM' (Description='DIRECTION COMMERCIALE')", () =>
+            {
+                string lastStatusText = string.Empty;
+                BoStatusBarMessageType lastMsgType = BoStatusBarMessageType.smt_None;
+
+                var validValues = new List<Tuple<string, string>>
+                {
+                    Tuple.Create("CC_GEN", "GÉNÉRAL"),
+                    Tuple.Create("CC_DIR_COM", "DIRECTION COMMERCIALE"),
+                    Tuple.Create("CC_MAINT", "MAINTENANCE"),
+                    Tuple.Create("CC_SUPP", "SUPPORT")
+                };
+
+                SetupMockEnvironment(
+                    itemDbValues: new Dictionary<string, string> { { "U_Analytique", "Direction commerciale" } },
+                    oocrEntries: null,
+                    matrixColName: "U_DocAnalytique",
+                    matrixColAlias: "U_DocAnalytique",
+                    itemCellValue: "ART-COMBO-DIR",
+                    useComboBox: true,
+                    comboValidValues: validValues,
+                    onStatusText: (txt, t) => { lastStatusText = txt; lastMsgType = t; },
+                    out var getWrittenValue);
+
+                ItemEvent evt = CreateMockItemEvent("139", "38", "1", 1, BoEventTypes.et_VALIDATE, itemChanged: true, cflItemCode: null);
+                Program.SBO_Application_ItemEvent("F_COMBO_VV", ref evt, out bool bubble);
+
+                return bubble &&
+                       getWrittenValue() == "CC_DIR_COM" &&
+                       lastMsgType == BoStatusBarMessageType.smt_Success;
+            });
+
+            // Test 8 : Vérifier le message d'avertissement quand l'article n'a pas de code analytique
             AssertTest("Avertissement dans la barre d'état si l'article n'a aucun code analytique", () =>
             {
                 string lastStatusText = string.Empty;
@@ -136,11 +179,12 @@ namespace SAP_Analytix
 
                 SetupMockEnvironment(
                     itemDbValues: new Dictionary<string, string> { { "U_Analytique", "" } },
-                    oocrDimMap: null,
+                    oocrEntries: null,
                     matrixColName: "U_DocAnalytique",
                     matrixColAlias: "U_DocAnalytique",
                     itemCellValue: "ART-VIDE",
                     useComboBox: false,
+                    comboValidValues: null,
                     onStatusText: (txt, t) => { lastStatusText = txt; lastMsgType = t; },
                     out var getWrittenValue);
 
@@ -170,11 +214,12 @@ namespace SAP_Analytix
 
             SetupMockEnvironment(
                 itemDbValues: new Dictionary<string, string> { { "U_Analytique", expectedCostCenter } },
-                oocrDimMap: null,
+                oocrEntries: null,
                 matrixColName: activeColName,
                 matrixColAlias: activeColName,
                 itemCellValue: eventType == BoEventTypes.et_CHOOSE_FROM_LIST ? "" : itemCode,
                 useComboBox: useComboBox,
+                comboValidValues: null,
                 onStatusText: (txt, t) => { lastStatusText = txt; lastMsgType = t; },
                 out var getWrittenValue);
 
@@ -204,11 +249,12 @@ namespace SAP_Analytix
 
             SetupMockEnvironment(
                 itemDbValues: new Dictionary<string, string> { { itemField, costCenter } },
-                oocrDimMap: new Dictionary<string, int> { { costCenter, dimCode } },
+                oocrEntries: new List<Tuple<string, string, int>> { Tuple.Create(costCenter, costCenter, dimCode) },
                 matrixColName: matrixColUID,
                 matrixColAlias: matrixColAlias,
                 itemCellValue: $"ART-AXE{dimCode}",
                 useComboBox: false,
+                comboValidValues: null,
                 onStatusText: (txt, t) => { lastStatusText = txt; lastMsgType = t; },
                 out var getWrittenValue);
 
@@ -228,11 +274,12 @@ namespace SAP_Analytix
 
             SetupMockEnvironment(
                 itemDbValues: new Dictionary<string, string> { { "U_Analytique", udfCostCenter } },
-                oocrDimMap: new Dictionary<string, int> { { udfCostCenter, oocrDimCode } },
+                oocrEntries: new List<Tuple<string, string, int>> { Tuple.Create(udfCostCenter, udfCostCenter, oocrDimCode) },
                 matrixColName: matrixColUID,
                 matrixColAlias: matrixColAlias,
                 itemCellValue: "ART-UDF-DIM3",
                 useComboBox: false,
+                comboValidValues: null,
                 onStatusText: (txt, t) => { lastStatusText = txt; lastMsgType = t; },
                 out var getWrittenValue);
 
@@ -245,13 +292,39 @@ namespace SAP_Analytix
                    lastStatusText.Contains(udfCostCenter);
         }
 
+        private static bool RunLabelResolutionScenario(string labelInItem, string expectedOcrCode, int dimCode, string matrixColUID, string matrixColAlias)
+        {
+            string lastStatusText = string.Empty;
+            BoStatusBarMessageType lastMsgType = BoStatusBarMessageType.smt_None;
+
+            SetupMockEnvironment(
+                itemDbValues: new Dictionary<string, string> { { "U_Analytique", labelInItem } },
+                oocrEntries: new List<Tuple<string, string, int>> { Tuple.Create(expectedOcrCode, labelInItem, dimCode) },
+                matrixColName: matrixColUID,
+                matrixColAlias: matrixColAlias,
+                itemCellValue: $"ART-LBL-{dimCode}",
+                useComboBox: false,
+                comboValidValues: null,
+                onStatusText: (txt, t) => { lastStatusText = txt; lastMsgType = t; },
+                out var getWrittenValue);
+
+            ItemEvent evt = CreateMockItemEvent("133", "38", "1", 1, BoEventTypes.et_VALIDATE, itemChanged: true, cflItemCode: null);
+            Program.SBO_Application_ItemEvent("F_LBL", ref evt, out bool bubble);
+
+            return bubble &&
+                   getWrittenValue() == expectedOcrCode &&
+                   lastMsgType == BoStatusBarMessageType.smt_Success &&
+                   lastStatusText.Contains(expectedOcrCode);
+        }
+
         private static void SetupMockEnvironment(
             Dictionary<string, string> itemDbValues,
-            Dictionary<string, int> oocrDimMap,
+            List<Tuple<string, string, int>> oocrEntries,
             string matrixColName,
             string matrixColAlias,
             string itemCellValue,
             bool useComboBox,
+            List<Tuple<string, string>> comboValidValues,
             Action<string, BoStatusBarMessageType> onStatusText,
             out Func<string> getWrittenValue)
         {
@@ -277,6 +350,21 @@ namespace SAP_Analytix
                 return null;
             });
 
+            Tuple<string, string, int> FindMatchingOocr(string query)
+            {
+                if (oocrEntries == null || string.IsNullOrEmpty(query))
+                    return null;
+                foreach (var entry in oocrEntries)
+                {
+                    if (query.IndexOf($"'{entry.Item1}'", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        query.IndexOf($"'{entry.Item2}'", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        return entry;
+                    }
+                }
+                return null;
+            }
+
             Program.oCompany = DynamicComMock.Create<SAPbobsCOM.Company>((method, args) =>
             {
                 if (method == "get_Connected") return true;
@@ -289,25 +377,31 @@ namespace SAP_Analytix
                         if (rm == "get_EoF")
                         {
                             if (lastQuery.Contains("\"OOCR\""))
-                                return oocrDimMap == null || oocrDimMap.Count == 0;
+                                return FindMatchingOocr(lastQuery) == null;
+                            if (lastQuery.Contains("\"OPRC\""))
+                                return true;
                             return false;
                         }
                         if (rm == "get_Fields")
                         {
-                            if (lastQuery.Contains("\"OOCR\"") && oocrDimMap != null)
+                            if (lastQuery.Contains("\"OOCR\""))
                             {
-                                int dimVal = 0;
-                                foreach (var kv in oocrDimMap)
-                                {
-                                    if (lastQuery.Contains(kv.Key)) { dimVal = kv.Value; break; }
-                                }
+                                var match = FindMatchingOocr(lastQuery);
                                 return DynamicComMock.Create<SAPbobsCOM.Fields>((fm, fa) =>
                                 {
                                     if (fm == "Item")
                                     {
+                                        string colKey = Convert.ToString(fa[0]);
+                                        object colVal = null;
+                                        if (match != null)
+                                        {
+                                            if (colKey == "OcrCode") colVal = match.Item1;
+                                            else if (colKey == "OcrName") colVal = match.Item2;
+                                            else if (colKey == "DimCode") colVal = match.Item3;
+                                        }
                                         return DynamicComMock.Create<SAPbobsCOM.Field>((flm, fla) =>
                                         {
-                                            if (flm == "get_Value") return dimVal;
+                                            if (flm == "get_Value") return colVal;
                                             return null;
                                         });
                                     }
@@ -367,10 +461,45 @@ namespace SAP_Analytix
             }
             else
             {
+                SAPbouiCOM.ValidValues mockValidValues = null;
+                if (comboValidValues != null)
+                {
+                    mockValidValues = DynamicComMock.Create<SAPbouiCOM.ValidValues>((vvm, vva) =>
+                    {
+                        if (vvm == "get_Count") return comboValidValues.Count;
+                        if (vvm == "Item")
+                        {
+                            int idx = Convert.ToInt32(vva[0]);
+                            var entry = comboValidValues[idx];
+                            return DynamicComMock.Create<SAPbouiCOM.ValidValue>((vm, va) =>
+                            {
+                                if (vm == "get_Value") return entry.Item1;
+                                if (vm == "get_Description") return entry.Item2;
+                                return null;
+                            });
+                        }
+                        return null;
+                    });
+                }
+
                 mockTargetCell = DynamicComMock.Create<SAPbouiCOM.ComboBox>((method, args) =>
                 {
                     if (method == "get_Selected") return null;
-                    if (method == "Select") { writtenValue = Convert.ToString(args[0]); return null; }
+                    if (method == "get_ValidValues") return mockValidValues;
+                    if (method == "Select")
+                    {
+                        BoSearchKey keyType = (BoSearchKey)args[1];
+                        if (keyType == BoSearchKey.psk_Index && comboValidValues != null)
+                        {
+                            int idx = Convert.ToInt32(args[0]);
+                            writtenValue = comboValidValues[idx].Item1;
+                        }
+                        else
+                        {
+                            writtenValue = Convert.ToString(args[0]);
+                        }
+                        return null;
+                    }
                     return null;
                 });
             }
