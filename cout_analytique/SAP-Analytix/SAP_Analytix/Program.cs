@@ -36,6 +36,26 @@ namespace SAP_Analytix
             AllUdfValues.Count > 0;
     }
 
+    internal class CostCenterCacheEntry
+    {
+        public string Code { get; set; }
+        public string Name { get; set; }
+        public int DimCode { get; set; }
+    }
+
+    internal class MatrixColumnMap
+    {
+        public Dictionary<int, string> DimensionCols { get; } = new Dictionary<int, string>();
+        public string PrimaryUdfCol { get; set; } = string.Empty;
+        public HashSet<string> EditableUdfCols { get; } = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    }
+
+    internal class CachedItemEntry
+    {
+        public DateTime LoadedAtUtc { get; set; }
+        public ItemAnalyticalData Data { get; set; }
+    }
+
     public static class Program
     {
         public static SAPbouiCOM.Application sboApplication;
@@ -44,6 +64,30 @@ namespace SAP_Analytix
         // Mémorise le dernier article sélectionné via ChooseFromList par ligne
         private static string _lastSelectedItemCode = string.Empty;
         private static int _lastSelectedRow = -1;
+
+        // Caches en mémoire pour éviter les freezes COM et les requêtes SQL répétitives
+        private static bool _oocrCacheLoaded = false;
+        private static readonly Dictionary<string, CostCenterCacheEntry> _oocrCache = new Dictionary<string, CostCenterCacheEntry>(StringComparer.OrdinalIgnoreCase);
+        private static List<string> _oitmAnalyticalColumns = null;
+        private static readonly Dictionary<string, MatrixColumnMap> _matrixColumnCache = new Dictionary<string, MatrixColumnMap>(StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<string, CachedItemEntry> _itemCache = new Dictionary<string, CachedItemEntry>(StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<string, string> _lastAppliedByFormRow = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        private static readonly TimeSpan ItemCacheTtl = TimeSpan.FromSeconds(60);
+
+        /// <summary>
+        /// Réinitialise tous les caches en mémoire (utile lors d'un changement de société ou pour les tests unitaires).
+        /// </summary>
+        public static void ResetCaches()
+        {
+            _oocrCacheLoaded = false;
+            _oocrCache.Clear();
+            _oitmAnalyticalColumns = null;
+            _matrixColumnCache.Clear();
+            _itemCache.Clear();
+            _lastAppliedByFormRow.Clear();
+            _lastSelectedItemCode = string.Empty;
+            _lastSelectedRow = -1;
+        }
 
         // Colonnes UDF personnalisées candidates sur les lignes de documents
         public static readonly string[] CandidateCustomUdfCols = new string[]
@@ -149,7 +193,7 @@ namespace SAP_Analytix
                     return;
                 }
 
-                Log("Démarrage de SAP_Analytix (Support multi-axes 1 à 5)...");
+                Log("Démarrage de SAP_Analytix (Mode optimisé haute performance, 5 axes)...");
 
                 // 1. Récupération de la chaîne de connexion passée par SAP B1
                 string connectionString = string.Empty;
@@ -200,7 +244,13 @@ namespace SAP_Analytix
 
                 Log($"Connecté à la société : {oCompany.CompanyName} ({oCompany.CompanyDB})");
 
-                // 4. Abonnement aux événements UI et Cycle de vie de l'application
+                // 4. Préchargement du cache OOCR/OPRC et découverte unique des colonnes OITM
+                EnsureCostCenterCacheLoaded();
+
+                // 5. Filtrage strict des événements UI (évite 99% du trafic COM inutile dans SAP)
+                SetApplicationFilters();
+
+                // 6. Abonnement aux événements UI et Cycle de vie de l'application
                 sboApplication.ItemEvent += new _IApplicationEvents_ItemEventEventHandler(SBO_Application_ItemEvent);
                 sboApplication.AppEvent += new _IApplicationEvents_AppEventEventHandler(SBO_Application_AppEvent);
 
@@ -224,6 +274,37 @@ namespace SAP_Analytix
         }
 
         /// <summary>
+        /// Filtre les événements UI API au niveau de SAP Business One afin que seuls
+        /// CHOOSE_FROM_LIST, VALIDATE, COMBO_SELECT et FORM_CLOSE sur les formulaires gérés
+        /// soient transmis à l'add-on (supprime les ralentissements sur tout le reste de SAP).
+        /// </summary>
+        private static void SetApplicationFilters()
+        {
+            try
+            {
+                EventFilters oFilters = new EventFilters();
+                EventFilter oFilterCfl = oFilters.Add(BoEventTypes.et_CHOOSE_FROM_LIST);
+                EventFilter oFilterVal = oFilters.Add(BoEventTypes.et_VALIDATE);
+                EventFilter oFilterCombo = oFilters.Add(BoEventTypes.et_COMBO_SELECT);
+                EventFilter oFilterClose = oFilters.Add(BoEventTypes.et_FORM_CLOSE);
+
+                foreach (string formType in FormConfigurations.Keys)
+                {
+                    oFilterCfl.AddEx(formType);
+                    oFilterVal.AddEx(formType);
+                    oFilterCombo.AddEx(formType);
+                    oFilterClose.AddEx(formType);
+                }
+
+                sboApplication.SetFilter(oFilters);
+            }
+            catch (Exception ex)
+            {
+                Log("Avertissement SetApplicationFilters : " + ex.Message);
+            }
+        }
+
+        /// <summary>
         /// Gestion des événements du cycle de vie de SAP Business One (fermeture, changement de société)
         /// </summary>
         public static void SBO_Application_AppEvent(BoAppEventTypes EventType)
@@ -234,6 +315,7 @@ namespace SAP_Analytix
                 case BoAppEventTypes.aet_CompanyChanged:
                 case BoAppEventTypes.aet_LanguageChanged:
                 case BoAppEventTypes.aet_ServerTerminition:
+                    ResetCaches();
                     System.Windows.Forms.Application.Exit();
                     break;
             }
@@ -251,6 +333,13 @@ namespace SAP_Analytix
                 if (pVal == null || pVal.BeforeAction)
                     return;
 
+                // Nettoyer les entrées de déduplication lorsqu'un formulaire se ferme
+                if (pVal.EventType == BoEventTypes.et_FORM_CLOSE)
+                {
+                    ClearFormRowTracking(FormUID);
+                    return;
+                }
+
                 if (string.IsNullOrEmpty(pVal.FormTypeEx) || !FormConfigurations.TryGetValue(pVal.FormTypeEx, out FormConfig config))
                     return;
 
@@ -264,7 +353,6 @@ namespace SAP_Analytix
                 bool isTriggerEvent =
                     pVal.EventType == BoEventTypes.et_CHOOSE_FROM_LIST ||
                     (pVal.EventType == BoEventTypes.et_VALIDATE && pVal.ItemChanged) ||
-                    pVal.EventType == BoEventTypes.et_LOST_FOCUS ||
                     pVal.EventType == BoEventTypes.et_COMBO_SELECT;
 
                 if (!isTriggerEvent)
@@ -276,15 +364,9 @@ namespace SAP_Analytix
 
                 try
                 {
-                    oForm = sboApplication.Forms.Item(FormUID);
-                    oMatrix = (SAPbouiCOM.Matrix)oForm.Items.Item(config.MatrixUID).Specific;
-
-                    if (pVal.Row > oMatrix.RowCount)
-                        return;
-
                     string itemCode = string.Empty;
 
-                    // Si c'est un ChooseFromList, récupérer l'ItemCode depuis SelectedObjects
+                    // Si c'est un ChooseFromList, récupérer l'ItemCode depuis SelectedObjects sans toucher la matrice si possible
                     if (pVal.EventType == BoEventTypes.et_CHOOSE_FROM_LIST)
                     {
                         try
@@ -307,6 +389,12 @@ namespace SAP_Analytix
                         }
                     }
 
+                    oForm = sboApplication.Forms.Item(FormUID);
+                    oMatrix = (SAPbouiCOM.Matrix)oForm.Items.Item(config.MatrixUID).Specific;
+
+                    if (pVal.Row > oMatrix.RowCount)
+                        return;
+
                     if (string.IsNullOrEmpty(itemCode))
                     {
                         try
@@ -328,21 +416,30 @@ namespace SAP_Analytix
                     if (string.IsNullOrEmpty(itemCode))
                         return;
 
+                    // Déduplication : évite d'exécuter 2 fois le traitement sur la même ligne quand et_VALIDATE suit immédiatement et_CHOOSE_FROM_LIST
+                    string formRowKey = $"{FormUID}|{pVal.Row}";
+                    if (_lastAppliedByFormRow.TryGetValue(formRowKey, out string alreadyAppliedItem) &&
+                        string.Equals(alreadyAppliedItem, itemCode, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return;
+                    }
+
                     ItemAnalyticalData analyticalData = GetAnalyticalDataFromItem(itemCode);
 
                     if (analyticalData == null || !analyticalData.HasAnyValue)
                     {
-                        if (pVal.EventType != BoEventTypes.et_LOST_FOCUS)
-                        {
-                            string msg = $"SAP_Analytix : Aucun code analytique défini sur l'article '{itemCode}'.";
-                            Log(msg);
-                            sboApplication.StatusBar.SetText(msg, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Warning);
-                        }
+                        string msg = $"SAP_Analytix : Aucun code analytique défini sur l'article '{itemCode}'.";
+                        sboApplication.StatusBar.SetText(msg, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Warning);
+                        _lastAppliedByFormRow[formRowKey] = itemCode;
                         return;
                     }
 
-                    // Affectation sur tous les axes analytiques concernés (1 à 5) et/ou l'UDF personnalisé
-                    ApplyAnalyticalDataToRow(oForm, oMatrix, config, pVal.Row, analyticalData, pVal.EventType);
+                    // Affectation sur tous les axes analytiques concernés (1 à 5) et/ou les colonnes UDF personnalisées
+                    bool applied = ApplyAnalyticalDataToRow(oForm, oMatrix, config, pVal.Row, analyticalData, pVal.EventType);
+                    if (applied)
+                    {
+                        _lastAppliedByFormRow[formRowKey] = itemCode;
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -366,8 +463,27 @@ namespace SAP_Analytix
             }
         }
 
+        private static void ClearFormRowTracking(string formUID)
+        {
+            if (string.IsNullOrEmpty(formUID) || _lastAppliedByFormRow.Count == 0)
+                return;
+
+            string prefix = formUID + "|";
+            var toRemove = new List<string>();
+            foreach (string key in _lastAppliedByFormRow.Keys)
+            {
+                if (key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                    toRemove.Add(key);
+            }
+            foreach (string key in toRemove)
+            {
+                _lastAppliedByFormRow.Remove(key);
+            }
+        }
+
         /// <summary>
-        /// Applique les codes analytiques de l'article sur les colonnes correspondantes (Axes 1 à 5 + UDF) de la ligne
+        /// Applique les codes analytiques de l'article sur les colonnes correspondantes (Axes 1 à 5 + UDF) de la ligne.
+        /// Utilise un cache de colonnes par FormTypeEx et Freeze(true/false) pour éviter tout ralentissement d'affichage.
         /// </summary>
         public static bool ApplyAnalyticalDataToRow(
             SAPbouiCOM.Form oForm,
@@ -380,7 +496,9 @@ namespace SAP_Analytix
             List<string> appliedSummary = new List<string>();
             bool anyColumnFound = false;
 
-            // Liste des variantes de valeur à essayer (code brut, code OcrCode résolu, libellé OcrName résolu)
+            // Récupérer ou construire une seule fois la carte des colonnes analytiques pour ce type de formulaire
+            MatrixColumnMap colMap = GetOrBuildMatrixColumnMap(oMatrix, config);
+
             List<string> BuildCandidates(string primaryVal, bool includeGlobalResolved)
             {
                 var list = new List<string>();
@@ -406,7 +524,10 @@ namespace SAP_Analytix
                 return list;
             }
 
-            // 1. Remplir les colonnes d'axes analytiques standard SAP (Dimensions 1 à 5 : Direction commerciale, Maintenance, Support, etc.)
+            // Préparer la liste des écritures à effectuer avant de geler le formulaire
+            var plannedWrites = new List<Tuple<string, string, List<string>>>();
+
+            // 1. Colonnes d'axes analytiques standard SAP (Dimensions 1 à 5)
             foreach (KeyValuePair<int, string> kvp in data.DimensionValues)
             {
                 int dimCode = kvp.Key;
@@ -414,56 +535,45 @@ namespace SAP_Analytix
                 if (string.IsNullOrEmpty(costCenter))
                     continue;
 
-                string dimColUID = FindColumnForDimension(oMatrix, dimCode);
-                if (!string.IsNullOrEmpty(dimColUID))
+                if (colMap.DimensionCols.TryGetValue(dimCode, out string dimColUID) && !string.IsNullOrEmpty(dimColUID))
                 {
                     anyColumnFound = true;
-                    if (WriteValueToMatrixCell(oMatrix, dimColUID, row, BuildCandidates(costCenter, includeGlobalResolved: false)))
-                    {
-                        appliedSummary.Add($"Axe {dimCode}: '{costCenter}' (col {dimColUID})");
-                    }
+                    plannedWrites.Add(Tuple.Create(dimColUID, $"Axe {dimCode}: '{costCenter}' (col {dimColUID})", BuildCandidates(costCenter, includeGlobalResolved: false)));
                 }
             }
 
-            // 2. Si l'article possède des champs UDF spécifiques (ex: U_DirComm, U_Maintenance, U_Support) qui existent aussi sur la ligne
+            // 2. Champs UDF spécifiques (ex: U_DirComm, U_Maintenance, U_Support) s'ils existent sur la ligne
             foreach (KeyValuePair<string, string> udfKvp in data.AllUdfValues)
             {
                 if (string.Equals(udfKvp.Key, "U_Analytique", StringComparison.OrdinalIgnoreCase))
                     continue;
 
-                if (ColumnExistsInMatrix(oMatrix, udfKvp.Key))
+                if (colMap.EditableUdfCols.Contains(udfKvp.Key))
                 {
                     anyColumnFound = true;
-                    if (WriteValueToMatrixCell(oMatrix, udfKvp.Key, row, BuildCandidates(udfKvp.Value, includeGlobalResolved: false)))
-                    {
-                        appliedSummary.Add($"{udfKvp.Key}: '{udfKvp.Value}'");
-                    }
+                    plannedWrites.Add(Tuple.Create(udfKvp.Key, $"{udfKvp.Key}: '{udfKvp.Value}'", BuildCandidates(udfKvp.Value, includeGlobalResolved: false)));
                 }
             }
 
-            // 3. Remplir la colonne UDF principale (ex: U_DocAnalytique) si elle existe sur la ligne
+            // 3. Colonne UDF principale (ex: U_DocAnalytique)
             if (!string.IsNullOrEmpty(data.CustomUdfValue))
             {
                 List<string> customCandidates = BuildCandidates(data.CustomUdfValue, includeGlobalResolved: true);
-                string udfColUID = FindCustomUdfColumnUID(oMatrix, config.CostCenterCol);
-                if (!string.IsNullOrEmpty(udfColUID))
+                if (!string.IsNullOrEmpty(colMap.PrimaryUdfCol))
                 {
                     anyColumnFound = true;
-                    if (WriteValueToMatrixCell(oMatrix, udfColUID, row, customCandidates))
-                    {
-                        appliedSummary.Add($"{udfColUID}: '{data.CustomUdfValue}'");
-                    }
+                    plannedWrites.Add(Tuple.Create(colMap.PrimaryUdfCol, $"{colMap.PrimaryUdfCol}: '{data.CustomUdfValue}'", customCandidates));
                 }
                 else if (!anyColumnFound)
                 {
-                    // Repli générique sur n'importe quelle colonne analytique disponible dans la matrice
-                    string fallbackColUID = FindTargetColumnUID(oMatrix, config.CostCenterCol);
-                    if (!string.IsNullOrEmpty(fallbackColUID))
+                    // Repli générique sur la première colonne d'axe disponible
+                    for (int dim = 1; dim <= 5; dim++)
                     {
-                        anyColumnFound = true;
-                        if (WriteValueToMatrixCell(oMatrix, fallbackColUID, row, customCandidates))
+                        if (colMap.DimensionCols.TryGetValue(dim, out string fallbackCol) && !string.IsNullOrEmpty(fallbackCol))
                         {
-                            appliedSummary.Add($"{fallbackColUID}: '{data.CustomUdfValue}'");
+                            anyColumnFound = true;
+                            plannedWrites.Add(Tuple.Create(fallbackCol, $"{fallbackCol}: '{data.CustomUdfValue}'", customCandidates));
+                            break;
                         }
                     }
                 }
@@ -471,24 +581,193 @@ namespace SAP_Analytix
 
             if (!anyColumnFound)
             {
-                if (eventType != BoEventTypes.et_LOST_FOCUS)
-                {
-                    string msg = $"SAP_Analytix : Colonnes analytiques introuvables ou masquées dans [{config.FormName}]. Activez les axes (1 à 5) ou '{config.CostCenterCol}' dans Paramètres de formulaire.";
-                    Log(msg);
-                    sboApplication.StatusBar.SetText(msg, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Error);
-                }
+                // Invalider le cache au cas où l'utilisateur vient d'activer la colonne dans Paramètres de formulaire
+                _matrixColumnCache.Remove(config.FormType);
+
+                string msg = $"SAP_Analytix : Colonnes analytiques introuvables ou masquées dans [{config.FormName}]. Activez les axes (1 à 5) ou '{config.CostCenterCol}' dans Paramètres de formulaire.";
+                Log(msg);
+                sboApplication.StatusBar.SetText(msg, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Error);
                 return false;
+            }
+
+            if (plannedWrites.Count == 0)
+                return false;
+
+            // Geler le formulaire une seule fois pour toutes les écritures de cellules afin d'éviter les recalculs multiples
+            bool frozen = false;
+            try
+            {
+                if (oForm != null)
+                {
+                    oForm.Freeze(true);
+                    frozen = true;
+                }
+
+                bool anyWriteFailed = false;
+                foreach (var write in plannedWrites)
+                {
+                    if (WriteValueToMatrixCell(oMatrix, write.Item1, row, write.Item3))
+                    {
+                        appliedSummary.Add(write.Item2);
+                    }
+                    else
+                    {
+                        anyWriteFailed = true;
+                    }
+                }
+
+                if (anyWriteFailed)
+                {
+                    // L'utilisateur a peut-être masqué/verrouillé une colonne entre-temps
+                    _matrixColumnCache.Remove(config.FormType);
+                }
+            }
+            finally
+            {
+                if (frozen && oForm != null)
+                {
+                    try { oForm.Freeze(false); } catch { }
+                }
             }
 
             if (appliedSummary.Count > 0)
             {
                 string successMsg = $"[{config.FormName}] Code analytique appliqué ligne {row} -> {string.Join(", ", appliedSummary)}";
-                Log(successMsg);
                 sboApplication.StatusBar.SetText(successMsg, BoMessageTime.bmt_Short, BoStatusBarMessageType.smt_Success);
                 return true;
             }
 
             return false;
+        }
+
+        /// <summary>
+        /// Scanne les colonnes de la matrice UNE SEULE FOIS par type de formulaire (1 passe unique, sans exceptions COM répétées).
+        /// </summary>
+        private static MatrixColumnMap GetOrBuildMatrixColumnMap(SAPbouiCOM.Matrix oMatrix, FormConfig config)
+        {
+            if (_matrixColumnCache.TryGetValue(config.FormType, out MatrixColumnMap cached))
+                return cached;
+
+            MatrixColumnMap map = new MatrixColumnMap();
+            SAPbouiCOM.Columns oCols = null;
+
+            try
+            {
+                oCols = oMatrix.Columns;
+                int count = oCols.Count;
+
+                // Index des UIDs connus par dimension pour correspondance O(1)
+                var knownUidToDim = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                foreach (var kv in DimensionColumnCandidates)
+                {
+                    foreach (string uid in kv.Value)
+                    {
+                        if (!knownUidToDim.ContainsKey(uid))
+                            knownUidToDim[uid] = kv.Key;
+                    }
+                }
+
+                string preferredFound = string.Empty;
+                string candidateUdfFound = string.Empty;
+                string genericUdfFound = string.Empty;
+
+                for (int i = 0; i < count; i++)
+                {
+                    SAPbouiCOM.Column col = null;
+                    SAPbouiCOM.DataBind db = null;
+                    try
+                    {
+                        col = oCols.Item(i);
+                        if (col == null || !col.Visible || !col.Editable)
+                            continue;
+
+                        string uid = col.UniqueID ?? string.Empty;
+                        if (string.IsNullOrEmpty(uid))
+                            continue;
+
+                        // 1. Vérifier si c'est une colonne UDF (U_*)
+                        if (uid.StartsWith("U_", StringComparison.OrdinalIgnoreCase))
+                        {
+                            map.EditableUdfCols.Add(uid);
+
+                            if (string.Equals(uid, config.CostCenterCol, StringComparison.OrdinalIgnoreCase))
+                            {
+                                preferredFound = uid;
+                            }
+                            else if (string.IsNullOrEmpty(candidateUdfFound))
+                            {
+                                foreach (string cand in CandidateCustomUdfCols)
+                                {
+                                    if (string.Equals(uid, cand, StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        candidateUdfFound = uid;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if (string.IsNullOrEmpty(genericUdfFound) &&
+                                (uid.IndexOf("Analyt", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                 uid.IndexOf("Cout", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                 uid.IndexOf("Cost", StringComparison.OrdinalIgnoreCase) >= 0))
+                            {
+                                genericUdfFound = uid;
+                            }
+                        }
+
+                        // 2. Vérifier si c'est l'une des 5 colonnes d'axes analytiques par UID connu
+                        if (knownUidToDim.TryGetValue(uid, out int dimFromUid))
+                        {
+                            if (!map.DimensionCols.ContainsKey(dimFromUid))
+                                map.DimensionCols[dimFromUid] = uid;
+                            continue;
+                        }
+
+                        // 3. Sinon vérifier DataBind.Alias (OcrCode, OcrCode2..5) seulement si tous les 5 axes ne sont pas encore trouvés
+                        if (map.DimensionCols.Count < 5 && !uid.StartsWith("U_", StringComparison.OrdinalIgnoreCase))
+                        {
+                            try
+                            {
+                                db = col.DataBind;
+                                string alias = db?.Alias ?? string.Empty;
+                                if (!string.IsNullOrEmpty(alias) && knownUidToDim.TryGetValue(alias, out int dimFromAlias))
+                                {
+                                    if (!map.DimensionCols.ContainsKey(dimFromAlias))
+                                        map.DimensionCols[dimFromAlias] = uid;
+                                }
+                            }
+                            catch
+                            {
+                                // Ignorer
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        // Ignorer
+                    }
+                    finally
+                    {
+                        ReleaseCom(ref db);
+                        ReleaseCom(ref col);
+                    }
+                }
+
+                map.PrimaryUdfCol = !string.IsNullOrEmpty(preferredFound)
+                    ? preferredFound
+                    : (!string.IsNullOrEmpty(candidateUdfFound) ? candidateUdfFound : genericUdfFound);
+
+                if (map.DimensionCols.Count > 0 || !string.IsNullOrEmpty(map.PrimaryUdfCol) || map.EditableUdfCols.Count > 0)
+                {
+                    _matrixColumnCache[config.FormType] = map;
+                }
+            }
+            finally
+            {
+                ReleaseCom(ref oCols);
+            }
+
+            return map;
         }
 
         private static bool WriteValueToMatrixCell(SAPbouiCOM.Matrix oMatrix, string targetColUID, int row, List<string> candidateValues)
@@ -527,7 +806,7 @@ namespace SAP_Analytix
                     }
                     return false;
                 }
-                // Cas 2 : Liste déroulante (ComboBox) avec recherche insensible à la casse/espaces/accents dans ValidValues
+                // Cas 2 : Liste déroulante (ComboBox)
                 else if (cellObj is SAPbouiCOM.ComboBox oComboCostCenter)
                 {
                     string currentValue = oComboCostCenter.Selected?.Value != null ? oComboCostCenter.Selected.Value.Trim() : string.Empty;
@@ -542,7 +821,7 @@ namespace SAP_Analytix
                         }
                     }
 
-                    // A. Recherche intelligente dans ValidValues (insensible à la casse, aux espaces et aux accents)
+                    // A. Recherche intelligente dans ValidValues si présent (insensible à la casse, aux espaces et aux accents)
                     SAPbouiCOM.ValidValues validValues = null;
                     try
                     {
@@ -668,193 +947,107 @@ namespace SAP_Analytix
         }
 
         /// <summary>
-        /// Trouve la colonne de la matrice correspondant exactement à l'axe analytique SAP (1 à 5)
-        /// via son DataBind.Alias (OcrCode, OcrCode2..5) ou son UID standard (2004..2008 / 110000109..110000113 / 10001066..10001072)
+        /// Charge en mémoire UNE SEULE FOIS les tables OOCR et OPRC afin d'éviter des requêtes SQL
+        /// répétées à chaque sélection d'article.
         /// </summary>
-        public static string FindColumnForDimension(SAPbouiCOM.Matrix oMatrix, int dimCode)
+        public static void EnsureCostCenterCacheLoaded()
         {
-            SAPbouiCOM.Columns oCols = null;
+            if (_oocrCacheLoaded || oCompany == null || !oCompany.Connected)
+                return;
+
+            _oocrCacheLoaded = true;
+            Recordset oRec = null;
+            SAPbobsCOM.Fields fields = null;
+
             try
             {
-                oCols = oMatrix.Columns;
-                string expectedAlias = dimCode <= 1 ? "OcrCode" : $"OcrCode{dimCode}";
+                oRec = (Recordset)oCompany.GetBusinessObject(BoObjectTypes.BoRecordset);
 
-                // 1. Tester les UIDs candidats connus pour cette dimension
-                if (DimensionColumnCandidates.TryGetValue(dimCode, out string[] candidates))
+                // 1. Charger OOCR en une seule requête
+                oRec.DoQuery("SELECT \"OcrCode\", \"OcrName\", \"DimCode\" FROM \"OOCR\"");
+                while (!oRec.EoF)
                 {
-                    foreach (string colUID in candidates)
-                    {
-                        if (ColumnExistsAndEditable(oCols, colUID))
-                            return colUID;
-                    }
+                    fields = oRec.Fields;
+                    string code = ReadFieldString(fields, "OcrCode");
+                    string name = ReadFieldString(fields, "OcrName");
+                    string dimStr = ReadFieldString(fields, "DimCode");
+                    int.TryParse(dimStr, out int dim);
+                    AddCostCenterToCache(code, name, dim);
+                    ReleaseCom(ref fields);
+                    oRec.MoveNext();
                 }
 
-                // 2. Parcourir les colonnes de la matrice pour vérifier DataBind.Alias == OcrCode / OcrCode2..5
-                // ou un UDF spécifique à cet axe (ex: U_Analytique3, U_Axe3)
-                int count = oCols.Count;
-                for (int i = 0; i < count; i++)
+                // 2. Compléter avec OPRC (au cas où un centre de coût n'est pas dans OOCR)
+                try
                 {
-                    SAPbouiCOM.Column col = null;
-                    SAPbouiCOM.DataBind db = null;
-                    try
+                    oRec.DoQuery("SELECT \"PrcCode\", \"PrcName\", \"DimCode\" FROM \"OPRC\"");
+                    while (!oRec.EoF)
                     {
-                        col = oCols.Item(i);
-                        if (col == null || !col.Visible || !col.Editable)
-                            continue;
-
-                        string uid = col.UniqueID ?? string.Empty;
-                        if (string.Equals(uid, expectedAlias, StringComparison.OrdinalIgnoreCase))
-                            return uid;
-
-                        try
-                        {
-                            db = col.DataBind;
-                            string alias = db?.Alias ?? string.Empty;
-                            if (string.Equals(alias, expectedAlias, StringComparison.OrdinalIgnoreCase))
-                                return uid;
-                        }
-                        catch
-                        {
-                            // Ignorer si DataBind non accessible
-                        }
-                    }
-                    catch
-                    {
-                        // Ignorer
-                    }
-                    finally
-                    {
-                        ReleaseCom(ref db);
-                        ReleaseCom(ref col);
+                        fields = oRec.Fields;
+                        string code = ReadFieldString(fields, "PrcCode");
+                        string name = ReadFieldString(fields, "PrcName");
+                        string dimStr = ReadFieldString(fields, "DimCode");
+                        int.TryParse(dimStr, out int dim);
+                        AddCostCenterToCache(code, name, dim);
+                        ReleaseCom(ref fields);
+                        oRec.MoveNext();
                     }
                 }
-
-                return string.Empty;
-            }
-            finally
-            {
-                ReleaseCom(ref oCols);
-            }
-        }
-
-        public static string FindCustomUdfColumnUID(SAPbouiCOM.Matrix oMatrix, string preferredCol)
-        {
-            SAPbouiCOM.Columns oCols = null;
-            try
-            {
-                oCols = oMatrix.Columns;
-
-                if (ColumnExistsAndEditable(oCols, preferredCol))
-                    return preferredCol;
-
-                foreach (string candidate in CandidateCustomUdfCols)
+                catch
                 {
-                    if (ColumnExistsAndEditable(oCols, candidate))
-                        return candidate;
+                    // Ignorer si OPRC non disponible
                 }
-
-                int count = oCols.Count;
-                for (int i = 0; i < count; i++)
-                {
-                    SAPbouiCOM.Column col = null;
-                    try
-                    {
-                        col = oCols.Item(i);
-                        string uid = col?.UniqueID ?? string.Empty;
-                        if (uid.StartsWith("U_", StringComparison.OrdinalIgnoreCase) &&
-                            (uid.IndexOf("Analyt", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                             uid.IndexOf("Cout", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                             uid.IndexOf("Cost", StringComparison.OrdinalIgnoreCase) >= 0) &&
-                            col.Visible && col.Editable)
-                        {
-                            return uid;
-                        }
-                    }
-                    catch
-                    {
-                        // Ignorer
-                    }
-                    finally
-                    {
-                        ReleaseCom(ref col);
-                    }
-                }
-
-                return string.Empty;
-            }
-            finally
-            {
-                ReleaseCom(ref oCols);
-            }
-        }
-
-        /// <summary>
-        /// Recherche n'importe quelle colonne analytique présente et visible dans la matrice
-        /// </summary>
-        public static string FindTargetColumnUID(SAPbouiCOM.Matrix oMatrix, string preferredCol)
-        {
-            string udfCol = FindCustomUdfColumnUID(oMatrix, preferredCol);
-            if (!string.IsNullOrEmpty(udfCol))
-                return udfCol;
-
-            for (int dim = 1; dim <= 5; dim++)
-            {
-                string dimCol = FindColumnForDimension(oMatrix, dim);
-                if (!string.IsNullOrEmpty(dimCol))
-                    return dimCol;
-            }
-
-            return string.Empty;
-        }
-
-        private static bool ColumnExistsInMatrix(SAPbouiCOM.Matrix oMatrix, string colUID)
-        {
-            SAPbouiCOM.Columns oCols = null;
-            try
-            {
-                oCols = oMatrix.Columns;
-                return ColumnExistsAndEditable(oCols, colUID);
-            }
-            finally
-            {
-                ReleaseCom(ref oCols);
-            }
-        }
-
-        private static bool ColumnExistsAndEditable(SAPbouiCOM.Columns oCols, string colUID)
-        {
-            if (string.IsNullOrEmpty(colUID))
-                return false;
-
-            SAPbouiCOM.Column oCol = null;
-            try
-            {
-                oCol = oCols.Item(colUID);
-                return oCol != null && oCol.Visible && oCol.Editable;
             }
             catch
             {
-                return false;
+                // En cas d'erreur au préchargement, on autorisera le fallback SQL unitaire
+                _oocrCacheLoaded = false;
             }
             finally
             {
-                ReleaseCom(ref oCol);
+                ReleaseCom(ref fields);
+                ReleaseCom(ref oRec);
             }
         }
 
+        private static void AddCostCenterToCache(string code, string name, int dim)
+        {
+            if (string.IsNullOrEmpty(code) && string.IsNullOrEmpty(name))
+                return;
+
+            var entry = new CostCenterCacheEntry
+            {
+                Code = !string.IsNullOrEmpty(code) ? code : name,
+                Name = !string.IsNullOrEmpty(name) ? name : code,
+                DimCode = (dim >= 1 && dim <= 5) ? dim : 0
+            };
+
+            string normCode = NormalizeForComparison(entry.Code);
+            if (!string.IsNullOrEmpty(normCode) && !_oocrCache.ContainsKey(normCode))
+                _oocrCache[normCode] = entry;
+
+            string normName = NormalizeForComparison(entry.Name);
+            if (!string.IsNullOrEmpty(normName) && !_oocrCache.ContainsKey(normName))
+                _oocrCache[normName] = entry;
+        }
+
         /// <summary>
-        /// Récupère toutes les données analytiques d'un article (OITM) :
-        /// - Les 5 axes analytiques standard (OcrCode, OcrCode2, OcrCode3, OcrCode4, OcrCode5)
-        /// - Les champs UDF personnalisés (U_Analytique, U_DirComm, U_Maintenance, U_Support, etc.)
-        /// - Et résout automatiquement le code officiel, le libellé et l'axe (DimCode 1 à 5) via OOCR et OPRC !
+        /// Récupère toutes les données analytiques d'un article (OITM) avec requête SQL ciblée (uniquement les colonnes analytiques)
+        /// et cache court (60s) pour une réponse quasi instantanée.
         /// </summary>
         public static ItemAnalyticalData GetAnalyticalDataFromItem(string itemCode)
         {
-            ItemAnalyticalData result = new ItemAnalyticalData();
-
             if (oCompany == null || !oCompany.Connected || string.IsNullOrEmpty(itemCode))
-                return result;
+                return new ItemAnalyticalData();
 
+            // Vérifier le cache article (valide 60 secondes)
+            if (_itemCache.TryGetValue(itemCode, out CachedItemEntry cached) &&
+                (DateTime.UtcNow - cached.LoadedAtUtc) < ItemCacheTtl)
+            {
+                return cached.Data;
+            }
+
+            ItemAnalyticalData result = new ItemAnalyticalData();
             Recordset oRec = null;
             SAPbobsCOM.Fields fields = null;
 
@@ -863,7 +1056,21 @@ namespace SAP_Analytix
                 oRec = (Recordset)oCompany.GetBusinessObject(BoObjectTypes.BoRecordset);
 
                 string safeItemCode = itemCode.Replace("'", "''");
-                string query = $"SELECT * FROM \"OITM\" WHERE \"ItemCode\" = '{safeItemCode}'";
+                string query;
+
+                if (_oitmAnalyticalColumns != null && _oitmAnalyticalColumns.Count > 0)
+                {
+                    // Requête légère ciblée (uniquement les 5-8 colonnes analytiques au lieu des 200+ colonnes de OITM)
+                    var colsSql = new List<string>(_oitmAnalyticalColumns.Count);
+                    foreach (string c in _oitmAnalyticalColumns)
+                        colsSql.Add($"\"{c}\"");
+                    query = $"SELECT {string.Join(", ", colsSql)} FROM \"OITM\" WHERE \"ItemCode\" = '{safeItemCode}'";
+                }
+                else
+                {
+                    // Première exécution : découvrir automatiquement quelles colonnes analytiques existent dans OITM
+                    query = $"SELECT * FROM \"OITM\" WHERE \"ItemCode\" = '{safeItemCode}'";
+                }
 
                 oRec.DoQuery(query);
 
@@ -871,10 +1078,37 @@ namespace SAP_Analytix
                 {
                     fields = oRec.Fields;
 
+                    // Si c'est la première exécution, mémoriser la liste exacte des colonnes analytiques présentes dans OITM
+                    if (_oitmAnalyticalColumns == null)
+                    {
+                        var discovered = new List<string>();
+                        int totalFields = fields.Count;
+                        for (int i = 0; i < totalFields; i++)
+                        {
+                            SAPbobsCOM.Field f = null;
+                            try
+                            {
+                                f = fields.Item(i);
+                                string name = f?.Name ?? string.Empty;
+                                if (IsTrackedOitmColumn(name))
+                                    discovered.Add(name);
+                            }
+                            finally
+                            {
+                                ReleaseCom(ref f);
+                            }
+                        }
+                        if (discovered.Count > 0)
+                            _oitmAnalyticalColumns = discovered;
+                    }
+
                     // 1. Lire les 5 axes analytiques standard sur la fiche article (OcrCode, OcrCode2, OcrCode3, OcrCode4, OcrCode5)
                     for (int dim = 1; dim <= 5; dim++)
                     {
                         string ocrFieldName = dim == 1 ? "OcrCode" : $"OcrCode{dim}";
+                        if (_oitmAnalyticalColumns != null && !_oitmAnalyticalColumns.Exists(c => string.Equals(c, ocrFieldName, StringComparison.OrdinalIgnoreCase)))
+                            continue;
+
                         string val = ReadFieldString(fields, ocrFieldName);
                         if (!string.IsNullOrEmpty(val))
                         {
@@ -889,6 +1123,9 @@ namespace SAP_Analytix
                     string[] udfCandidates = new[] { "U_Analytique", "U_DocAnalytique", "U_CodeAnalytique", "U_CentreCout" };
                     foreach (string udfName in udfCandidates)
                     {
+                        if (_oitmAnalyticalColumns != null && !_oitmAnalyticalColumns.Exists(c => string.Equals(c, udfName, StringComparison.OrdinalIgnoreCase)))
+                            continue;
+
                         string val = ReadFieldString(fields, udfName);
                         if (!string.IsNullOrEmpty(val))
                         {
@@ -897,43 +1134,29 @@ namespace SAP_Analytix
                         }
                     }
 
-                    // 3. Parcourir tous les autres champs UDF (U_*) de OITM liés à l'analytique
-                    // (ex: U_Analytique1..5, U_Axe1..5, U_DirComm, U_Direction, U_Maintenance, U_Support)
-                    int fieldCount = fields.Count;
-                    for (int i = 0; i < fieldCount; i++)
+                    // 3. Lire les autres champs UDF analytiques découverts dans OITM
+                    if (_oitmAnalyticalColumns != null)
                     {
-                        SAPbobsCOM.Field f = null;
-                        try
+                        foreach (string colName in _oitmAnalyticalColumns)
                         {
-                            f = fields.Item(i);
-                            string name = f?.Name ?? string.Empty;
-                            if (!name.StartsWith("U_", StringComparison.OrdinalIgnoreCase))
+                            if (!colName.StartsWith("U_", StringComparison.OrdinalIgnoreCase) || result.AllUdfValues.ContainsKey(colName))
                                 continue;
 
-                            if (IsAnalyticalUdfFieldName(name))
+                            string strVal = ReadFieldString(fields, colName);
+                            if (!string.IsNullOrEmpty(strVal))
                             {
-                                object raw = f.Value;
-                                if (raw != null && !(raw is DBNull))
-                                {
-                                    string strVal = raw.ToString().Trim();
-                                    if (!string.IsNullOrEmpty(strVal) && !result.AllUdfValues.ContainsKey(name))
-                                    {
-                                        result.AllUdfValues[name] = strVal;
-                                        RegisterUdfAnalyticalValue(result, strVal);
-                                    }
-                                }
+                                result.AllUdfValues[colName] = strVal;
+                                RegisterUdfAnalyticalValue(result, strVal);
                             }
-                        }
-                        catch
-                        {
-                            // Ignorer
-                        }
-                        finally
-                        {
-                            ReleaseCom(ref f);
                         }
                     }
                 }
+
+                _itemCache[itemCode] = new CachedItemEntry
+                {
+                    LoadedAtUtc = DateTime.UtcNow,
+                    Data = result
+                };
             }
             catch (Exception ex)
             {
@@ -947,6 +1170,23 @@ namespace SAP_Analytix
             }
 
             return result;
+        }
+
+        private static bool IsTrackedOitmColumn(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+                return false;
+
+            if (string.Equals(name, "OcrCode", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(name, "OcrCode2", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(name, "OcrCode3", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(name, "OcrCode4", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(name, "OcrCode5", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            return name.StartsWith("U_", StringComparison.OrdinalIgnoreCase) && IsAnalyticalUdfFieldName(name);
         }
 
         private static bool IsAnalyticalUdfFieldName(string name)
@@ -1004,8 +1244,8 @@ namespace SAP_Analytix
         }
 
         /// <summary>
-        /// Interroge les tables SAP OOCR (Règles de répartition) et OPRC (Centres de coûts) par Code OU par Nom
-        /// pour résoudre le code officiel (OcrCode), le libellé (OcrName) et le numéro d'axe (DimCode 1 à 5).
+        /// Résout un centre de coût (par Code ou par Nom) en priorité depuis le cache mémoire OOCR/OPRC (0 ms),
+        /// puis en fallback SQL si absent du cache.
         /// </summary>
         public static int ResolveCostCenterInSap(string codeOrName, out string resolvedCode, out string resolvedName, out int resolvedDim)
         {
@@ -1016,6 +1256,21 @@ namespace SAP_Analytix
             if (oCompany == null || !oCompany.Connected || string.IsNullOrEmpty(codeOrName))
                 return 0;
 
+            // 1. Lookup instantané dans le cache mémoire OOCR/OPRC
+            string normKey = NormalizeForComparison(codeOrName);
+            if (_oocrCache.TryGetValue(normKey, out CostCenterCacheEntry cachedEntry))
+            {
+                resolvedCode = cachedEntry.Code;
+                resolvedName = cachedEntry.Name;
+                resolvedDim = cachedEntry.DimCode;
+                return resolvedDim;
+            }
+
+            // Si le cache global a déjà été chargé et ne contient pas ce code, ne pas re-requêter SQL inutilement
+            if (_oocrCacheLoaded && _oocrCache.Count > 0)
+                return 0;
+
+            // 2. Fallback SQL unitaire (si le préchargement n'a pas encore tourné)
             Recordset oRec = null;
             SAPbobsCOM.Fields fields = null;
 
@@ -1024,7 +1279,6 @@ namespace SAP_Analytix
                 oRec = (Recordset)oCompany.GetBusinessObject(BoObjectTypes.BoRecordset);
                 string safeVal = codeOrName.Replace("'", "''");
 
-                // 1. Recherche exacte (insensible à la casse) dans OOCR par OcrCode ou OcrName
                 string query = $"SELECT \"OcrCode\", \"OcrName\", \"DimCode\" FROM \"OOCR\" WHERE UPPER(\"OcrCode\") = UPPER('{safeVal}') OR UPPER(\"OcrName\") = UPPER('{safeVal}')";
                 oRec.DoQuery(query);
 
@@ -1040,10 +1294,11 @@ namespace SAP_Analytix
                     }
                     if (string.IsNullOrEmpty(resolvedCode))
                         resolvedCode = codeOrName;
+
+                    AddCostCenterToCache(resolvedCode, resolvedName, resolvedDim);
                     return resolvedDim;
                 }
 
-                // 2. Fallback dans OPRC (Centres de coûts : PrcCode / PrcName / DimCode)
                 ReleaseCom(ref fields);
                 string queryOprc = $"SELECT \"PrcCode\", \"PrcName\", \"DimCode\" FROM \"OPRC\" WHERE UPPER(\"PrcCode\") = UPPER('{safeVal}') OR UPPER(\"PrcName\") = UPPER('{safeVal}')";
                 oRec.DoQuery(queryOprc);
@@ -1060,6 +1315,8 @@ namespace SAP_Analytix
                     }
                     if (string.IsNullOrEmpty(resolvedCode))
                         resolvedCode = codeOrName;
+
+                    AddCostCenterToCache(resolvedCode, resolvedName, resolvedDim);
                     return resolvedDim;
                 }
             }

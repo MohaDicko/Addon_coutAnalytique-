@@ -197,6 +197,30 @@ namespace SAP_Analytix
                        lastStatusText.Contains("ART-VIDE");
             });
 
+            // Test 9 : Performance / Déduplication — et_VALIDATE après et_CHOOSE_FROM_LIST ne ré-exécute pas le traitement
+            AssertTest("Performance : déduplication (et_VALIDATE après et_CHOOSE_FROM_LIST sur la même ligne = 0 recalcul)", () =>
+            {
+                int statusCalls = 0;
+                SetupMockEnvironment(
+                    itemDbValues: new Dictionary<string, string> { { "OcrCode3", "DIR-COMM" } },
+                    oocrEntries: new List<Tuple<string, string, int>> { Tuple.Create("DIR-COMM", "Direction commerciale", 3) },
+                    matrixColName: "2006",
+                    matrixColAlias: "OcrCode3",
+                    itemCellValue: "ART-PERF",
+                    useComboBox: false,
+                    comboValidValues: null,
+                    onStatusText: (txt, t) => { statusCalls++; },
+                    out var getWrittenValue);
+
+                ItemEvent evtCfl = CreateMockItemEvent("142", "38", "1", 1, BoEventTypes.et_CHOOSE_FROM_LIST, itemChanged: true, cflItemCode: "ART-PERF");
+                Program.SBO_Application_ItemEvent("F_PERF", ref evtCfl, out bool bubble1);
+
+                ItemEvent evtVal = CreateMockItemEvent("142", "38", "1", 1, BoEventTypes.et_VALIDATE, itemChanged: true, cflItemCode: null);
+                Program.SBO_Application_ItemEvent("F_PERF", ref evtVal, out bool bubble2);
+
+                return bubble1 && bubble2 && getWrittenValue() == "DIR-COMM" && statusCalls == 1;
+            });
+
             LogLine("------------------------------------------------------------");
             LogLine($"Résultat : {passed} test(s) réussi(s), {failed} échec(s).");
             LogLine("============================================================");
@@ -328,6 +352,7 @@ namespace SAP_Analytix
             Action<string, BoStatusBarMessageType> onStatusText,
             out Func<string> getWrittenValue)
         {
+            Program.ResetCaches();
             string writtenValue = string.Empty;
             getWrittenValue = () => writtenValue;
 
